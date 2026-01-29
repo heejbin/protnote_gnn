@@ -1,6 +1,65 @@
 import torch
 from typing import List, Tuple
 
+try:
+    from torch_geometric.data import Batch as PyGBatch
+except ImportError:
+    PyGBatch = None
+
+
+def collate_structure_batch(
+    batch: List[dict],
+    label_sample_size=None,
+    distribute_labels=False,
+    shuffle_labels=False,
+    in_batch_sampling=False,
+    grid_sampler=False,
+    world_size=1,
+    rank=0,
+):
+    """
+    Collate for structural encoder: list of dicts with structure_batch (PyG Data), label_multihots, etc.
+    Returns dict with structure_batch (PyG Batch), sequence_ids, label_multihots, label_embeddings, label_token_counts.
+    """
+    if PyGBatch is None:
+        raise ImportError("collate_structure_batch requires torch_geometric: pip install torch-geometric")
+    graphs = [item["structure_batch"] for item in batch]
+    structure_batch = PyGBatch.from_data_list(graphs)
+    sequence_ids = [item["sequence_id"] for item in batch]
+    label_multihots = torch.stack([item["label_multihots"] for item in batch])
+    label_embeddings = batch[0]["label_embeddings"]
+    label_token_counts = batch[0]["label_token_counts"]
+
+    if label_sample_size and not grid_sampler and not in_batch_sampling:
+        num_labels = label_multihots.shape[1]
+        if distribute_labels:
+            labels_per_partition = num_labels // world_size
+            start_idx = rank * labels_per_partition
+            end_idx = start_idx + labels_per_partition
+            sampled_label_indices = torch.arange(start_idx, end_idx)[: label_sample_size // world_size]
+        else:
+            sampled_label_indices = (
+                torch.randperm(num_labels)[:label_sample_size]
+                if shuffle_labels
+                else torch.arange(min(label_sample_size, num_labels))
+            )
+        label_embeddings = label_embeddings[sampled_label_indices]
+        label_multihots = label_multihots[:, sampled_label_indices]
+        label_token_counts = label_token_counts[sampled_label_indices]
+    elif in_batch_sampling:
+        sampled_label_indices = torch.where(label_multihots.sum(dim=0) > 0)[0]
+        label_embeddings = label_embeddings[sampled_label_indices]
+        label_multihots = label_multihots[:, sampled_label_indices]
+        label_token_counts = label_token_counts[sampled_label_indices]
+
+    return {
+        "structure_batch": structure_batch,
+        "sequence_ids": sequence_ids,
+        "label_multihots": label_multihots,
+        "label_embeddings": label_embeddings,
+        "label_token_counts": label_token_counts,
+    }
+
 
 def collate_variable_sequence_length(
     batch: List[Tuple],

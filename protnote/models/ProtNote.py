@@ -170,6 +170,7 @@ class ProtNote(nn.Module):
         sequence_onehots=None,
         sequence_embeddings=None,
         sequence_lengths=None,
+        structure_batch=None,
         tokenized_labels=None,
         label_embeddings=None,
         label_token_counts=None,
@@ -182,6 +183,7 @@ class ProtNote(nn.Module):
             sequence_onehots (optional): Tensor of one-hot encoded protein sequences.
             sequence_embeddings (optional): Tensor of pre-trained sequence embeddings.
             sequence_lengths (optional): Tensor of sequence lengths.
+            structure_batch (optional): PyG Batch for structural encoder (x, plm, edge_index, edge_s, batch).
             tokenized_labels (optional): List of tokenized label sequences.
             label_embeddings (optional): Tensor of pre-trained label embeddings.
         """
@@ -239,28 +241,34 @@ class ProtNote(nn.Module):
             # Add the scaled noise to the original label embeddings
             L_f = L_f + scaled_noise
 
-        # ---------------------- SEQUENCE EMBEDDINGS ----------------------#
+        # ---------------------- PROTEIN (SEQUENCE / STRUCTURE) EMBEDDINGS ----------------------#
         if sequence_embeddings is not None and (
             not self.train_sequence_encoder or not self.training
         ):
             # If sequence embeddings are provided and we don't need to propagate gradients (either because we aren't in training, or we didn't freeze the weights), use them.
             P_f = sequence_embeddings
-        elif sequence_onehots is not None and sequence_lengths is not None:
-            # Otherwise, compute them on the fly (with or without gradients, depending on self.train_sequence_encoder).
+        elif structure_batch is not None:
+            # Structural encoder: PyG Batch -> get_embeddings(batch) -> (N, protein_embedding_dim)
             if self.train_sequence_encoder and self.training:
-                # Compute embeddings with gradient calculations enabled
+                P_f = self.sequence_encoder.get_embeddings(structure_batch)
+            else:
+                with torch.no_grad():
+                    P_f = self.sequence_encoder.get_embeddings(structure_batch)
+        elif sequence_onehots is not None and sequence_lengths is not None:
+            # Sequence encoder (ProteInfer): onehots + lengths -> get_embeddings
+            if self.train_sequence_encoder and self.training:
                 P_f = self.sequence_encoder.get_embeddings(
                     sequence_onehots, sequence_lengths
                 )
             else:
-                # Compute embeddings with gradient calculations disabled
                 with torch.no_grad():
                     P_f = self.sequence_encoder.get_embeddings(
                         sequence_onehots, sequence_lengths
                     )
         else:
             raise ValueError(
-                "Incompatible sequence parameters passed to forward method."
+                "Incompatible sequence/structure parameters passed to forward method. "
+                "Provide either (sequence_onehots, sequence_lengths), structure_batch, or sequence_embeddings."
             )
 
         if self.label_embedding_pooling_method == "all":

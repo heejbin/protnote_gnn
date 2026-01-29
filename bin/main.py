@@ -5,9 +5,14 @@ from protnote.data.datasets import (
     create_multiple_loaders,
     calculate_sequence_weights,
 )
+from protnote.data.structural_datasets import (
+    ProteinStructureDataset,
+    create_structural_loaders,
+)
 from protnote.models.ProtNoteTrainer import ProtNoteTrainer
 from protnote.models.ProtNote import ProtNote
 from protnote.models.protein_encoders import ProteInfer
+from protnote.models.egnn import StructuralProteinEncoder
 from protnote.utils.losses import get_loss
 from protnote.utils.evaluation import EvalMetrics
 from protnote.utils.models import (
@@ -211,7 +216,8 @@ def train_validate_test(gpu, args):
     is_master = rank == 0
     
     # Unpack and process the config file
-    args.model_file = project_root / 'data' / 'models' / 'ProtNote' / args.model_file
+    if args.model_file is not None:
+        args.model_file = project_root / 'data' / 'models' / 'ProtNote' / args.model_file
     args.save_val_test_metrics_file = project_root / 'outputs' / 'results' / args.save_val_test_metrics_file
     task = args.annotations_path_name.split("_")[0]
     config = get_setup(
@@ -277,42 +283,59 @@ def train_validate_test(gpu, args):
         raise NotImplementedError("Gradient checkpointing is not yet implemented.")
 
     # ---------------------- DATASETS ----------------------#
-    # Create individual datasets
-    train_dataset = (
-        ProteinDataset(
-            data_paths=config["dataset_paths"]["train"][0],
-            config=config,
-            logger=logger,
-            require_label_idxs=params["GRID_SAMPLER"],
-            label_tokenizer=label_tokenizer,
-        )
-        if args.train_path_name is not None
-        else None
-    )
+    use_structural_encoder = params.get("USE_STRUCTURAL_ENCODER", False)
+    graph_plm_path = config["paths"].get("STRUCTURE_GRAPH_PKL") if use_structural_encoder else None
 
-    validation_dataset = (
-        ProteinDataset(
-            data_paths=config["dataset_paths"]["validation"][0],
-            config=config,
-            logger=logger,
-            require_label_idxs=False,  # Label indices are not required for validation.
-            label_tokenizer=label_tokenizer,
-        )
-        if args.validation_path_name is not None
-        else None
-    )
+    def _data_paths(split_key):
+        d = config["dataset_paths"][split_key][0]
+        if use_structural_encoder and graph_plm_path:
+            d = {**d, "graph_plm_pkl_path": graph_plm_path}
+        return d
 
-    test_dataset = (
-        ProteinDataset(
-            data_paths=config["dataset_paths"]["test"][0],
-            config=config,
-            logger=logger,
-            require_label_idxs=False,  # Label indices are not required for testing
-            label_tokenizer=label_tokenizer,
+    if use_structural_encoder:
+        train_dataset = (
+            ProteinStructureDataset(data_paths=_data_paths("train"), config=config, logger=logger, label_tokenizer=label_tokenizer)
+            if args.train_path_name is not None else None
         )
-        if args.test_paths_names is not None
-        else None
-    )
+        validation_dataset = (
+            ProteinStructureDataset(data_paths=_data_paths("validation"), config=config, logger=logger, label_tokenizer=label_tokenizer)
+            if args.validation_path_name is not None else None
+        )
+        test_dataset = (
+            ProteinStructureDataset(data_paths=_data_paths("test"), config=config, logger=logger, label_tokenizer=label_tokenizer)
+            if args.test_paths_names is not None else None
+        )
+    else:
+        train_dataset = (
+            ProteinDataset(
+                data_paths=config["dataset_paths"]["train"][0],
+                config=config,
+                logger=logger,
+                require_label_idxs=params["GRID_SAMPLER"],
+                label_tokenizer=label_tokenizer,
+            )
+            if args.train_path_name is not None else None
+        )
+        validation_dataset = (
+            ProteinDataset(
+                data_paths=config["dataset_paths"]["validation"][0],
+                config=config,
+                logger=logger,
+                require_label_idxs=False,
+                label_tokenizer=label_tokenizer,
+            )
+            if args.validation_path_name is not None else None
+        )
+        test_dataset = (
+            ProteinDataset(
+                data_paths=config["dataset_paths"]["test"][0],
+                config=config,
+                logger=logger,
+                require_label_idxs=False,
+                label_tokenizer=label_tokenizer,
+            )
+            if args.test_paths_names is not None else None
+        )
 
     # Add datasets to a dictionary
     # TODO: This does not support multiple datasets. But I think we should remove that support anyway. Too complicated.
@@ -365,44 +388,76 @@ def train_validate_test(gpu, args):
             ]
 
     logger.info("Initializing data loaders...")
-    # Define data loaders
-    loaders = create_multiple_loaders(
-        datasets,
-        params,
-        label_sample_sizes=label_sample_sizes,
-        shuffle_labels=params["SHUFFLE_LABELS"],
-        in_batch_sampling=params["IN_BATCH_SAMPLING"],
-        grid_sampler=params["GRID_SAMPLER"],
-        num_workers=params["NUM_WORKERS"],
-        world_size=args.world_size,
-        rank=rank,
-        sequence_weights=sequence_weights,
-    )
-
-    # Initialize ProteInfer
-    if params["PRETRAINED_SEQUENCE_ENCODER"] & (args.model_file is None):
-        sequence_encoder = ProteInfer.from_pretrained(
-            weights_path=paths[f"PROTEINFER_{task}_WEIGHTS_PATH"],
-            num_labels=config["embed_sequences_params"]["PROTEINFER_NUM_GO_LABELS"],
-            input_channels=config["embed_sequences_params"]["INPUT_CHANNELS"],
-            output_channels=config["embed_sequences_params"]["OUTPUT_CHANNELS"],
-            kernel_size=config["embed_sequences_params"]["KERNEL_SIZE"],
-            activation=torch.nn.ReLU,
-            dilation_base=config["embed_sequences_params"]["DILATION_BASE"],
-            num_resnet_blocks=config["embed_sequences_params"]["NUM_RESNET_BLOCKS"],
-            bottleneck_factor=config["embed_sequences_params"]["BOTTLENECK_FACTOR"],
+    if use_structural_encoder:
+        loaders = create_structural_loaders(
+            datasets,
+            params,
+            label_sample_sizes=label_sample_sizes,
+            shuffle_labels=params["SHUFFLE_LABELS"],
+            in_batch_sampling=params["IN_BATCH_SAMPLING"],
+            num_workers=params["NUM_WORKERS"],
+            world_size=args.world_size,
+            rank=rank,
+            sequence_weights=sequence_weights,
         )
     else:
-        sequence_encoder = ProteInfer(
-            num_labels=config["embed_sequences_params"]["PROTEINFER_NUM_GO_LABELS"],
-            input_channels=config["embed_sequences_params"]["INPUT_CHANNELS"],
-            output_channels=config["embed_sequences_params"]["OUTPUT_CHANNELS"],
-            kernel_size=config["embed_sequences_params"]["KERNEL_SIZE"],
-            activation=torch.nn.ReLU,
-            dilation_base=config["embed_sequences_params"]["DILATION_BASE"],
-            num_resnet_blocks=config["embed_sequences_params"]["NUM_RESNET_BLOCKS"],
-            bottleneck_factor=config["embed_sequences_params"]["BOTTLENECK_FACTOR"],
+        loaders = create_multiple_loaders(
+            datasets,
+            params,
+            label_sample_sizes=label_sample_sizes,
+            shuffle_labels=params["SHUFFLE_LABELS"],
+            in_batch_sampling=params["IN_BATCH_SAMPLING"],
+            grid_sampler=params["GRID_SAMPLER"],
+            num_workers=params["NUM_WORKERS"],
+            world_size=args.world_size,
+            rank=rank,
+            sequence_weights=sequence_weights,
         )
+
+    # Initialize protein encoder: Structural (EGNN) or Sequence (ProteInfer)
+    use_structural_encoder = params.get("USE_STRUCTURAL_ENCODER", False)
+    if use_structural_encoder:
+        # Structural-Sequential encoder (EGNN from StrucToxNet); expects PyG Batch with .x, .plm, .edge_index, .edge_s, .batch
+        struct_params = config.get("structural_encoder_params", {})
+        plm_model = struct_params.get("PLM_MODEL", "ProtT5")
+        plm_embedding_dim_map = {"ProtT5": 1069, "ESM-C": 1280}
+        plm_embedding_dim = struct_params.get("PLM_EMBEDDING_DIM") or plm_embedding_dim_map.get(
+            plm_model, plm_embedding_dim_map["ProtT5"]
+        )
+        sequence_encoder = StructuralProteinEncoder(
+            plm_embedding_dim=plm_embedding_dim,
+            protein_embedding_dim=params["PROTEIN_EMBEDDING_DIM"],
+            hidden_nf=struct_params.get("HIDDEN_NF", 256),
+            num_layers=struct_params.get("NUM_LAYERS", 3),
+            in_edge_nf=struct_params.get("IN_EDGE_NF", 16),
+            dropout=struct_params.get("DROPOUT", 0.5),
+        )
+        logger.info("Using StructuralProteinEncoder (EGNN). Ensure data loaders provide structure_batch (Phase 3 pipeline).")
+    else:
+        # ProteInfer sequence encoder
+        if params["PRETRAINED_SEQUENCE_ENCODER"] & (args.model_file is None):
+            sequence_encoder = ProteInfer.from_pretrained(
+                weights_path=paths[f"PROTEINFER_{task}_WEIGHTS_PATH"],
+                num_labels=config["embed_sequences_params"]["PROTEINFER_NUM_GO_LABELS"],
+                input_channels=config["embed_sequences_params"]["INPUT_CHANNELS"],
+                output_channels=config["embed_sequences_params"]["OUTPUT_CHANNELS"],
+                kernel_size=config["embed_sequences_params"]["KERNEL_SIZE"],
+                activation=torch.nn.ReLU,
+                dilation_base=config["embed_sequences_params"]["DILATION_BASE"],
+                num_resnet_blocks=config["embed_sequences_params"]["NUM_RESNET_BLOCKS"],
+                bottleneck_factor=config["embed_sequences_params"]["BOTTLENECK_FACTOR"],
+            )
+        else:
+            sequence_encoder = ProteInfer(
+                num_labels=config["embed_sequences_params"]["PROTEINFER_NUM_GO_LABELS"],
+                input_channels=config["embed_sequences_params"]["INPUT_CHANNELS"],
+                output_channels=config["embed_sequences_params"]["OUTPUT_CHANNELS"],
+                kernel_size=config["embed_sequences_params"]["KERNEL_SIZE"],
+                activation=torch.nn.ReLU,
+                dilation_base=config["embed_sequences_params"]["DILATION_BASE"],
+                num_resnet_blocks=config["embed_sequences_params"]["NUM_RESNET_BLOCKS"],
+                bottleneck_factor=config["embed_sequences_params"]["BOTTLENECK_FACTOR"],
+            )
 
     model = ProtNote(
         # Parameters

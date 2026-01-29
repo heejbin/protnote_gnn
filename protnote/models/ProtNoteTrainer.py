@@ -28,6 +28,11 @@ from torch.cuda.amp import autocast, GradScaler
 from torch.nn.utils import clip_grad_norm_
 from transformers import BatchEncoding
 from protnote.utils.models import biogpt_train_last_n_layers, save_checkpoint, load_model
+from protnote.utils.interpretability import (
+    load_site_ground_truth_tsv,
+    gradient_input_node_attribution_from_logits,
+    interpretability_loss_mse,
+)
 from torcheval.metrics import (
     MultilabelAUPRC,
     BinaryAUPRC,
@@ -129,6 +134,21 @@ class ProtNoteTrainer:
         self.config = config
         self.num_epochs = config["params"]["NUM_EPOCHS"]
         self.train_sequence_encoder = config["params"]["TRAIN_SEQUENCE_ENCODER"]
+        self.use_structural_encoder = config["params"].get("USE_STRUCTURAL_ENCODER", False)
+        self.interpretability_method = (config["params"].get("INTERPRETABILITY_METHOD", "none") or "none").strip().lower()
+        self.interpretability_weight = config["params"].get("INTERPRETABILITY_WEIGHT", 0.1)
+        self.interpretability_n_steps = config["params"].get("INTERPRETABILITY_N_STEPS", 50)
+        self._site_ground_truth = None
+        if self.interpretability_method == "integratedgradient" and self.use_structural_encoder:
+            tsv_path = config["paths"].get("INTERPRETABILITY_SITE_TSV_PATH")
+            if tsv_path and os.path.isfile(tsv_path):
+                self._site_ground_truth = load_site_ground_truth_tsv(tsv_path)
+                self.logger.info(f"Interpretability: loaded site ground truth for {len(self._site_ground_truth)} entries from {tsv_path}")
+            else:
+                self.logger.warning(
+                    "INTERPRETABILITY_METHOD=IntegratedGradient but INTERPRETABILITY_SITE_TSV_PATH missing or not a file; interpretability loss disabled."
+                )
+                self._site_ground_truth = {}
         self.label_encoder_num_trainable_layers = config["params"][
             "LABEL_ENCODER_NUM_TRAINABLE_LAYERS"
         ]
@@ -179,7 +199,9 @@ class ProtNoteTrainer:
     def _to_device(self, *args):
         processed_args = []
         for item in args:
-            if isinstance(item, torch.Tensor):
+            if item is None:
+                processed_args.append(item)
+            elif isinstance(item, torch.Tensor):
                 processed_args.append(item.to(self.device))
             elif isinstance(item, BatchEncoding) or isinstance(item, dict):
                 processed_dict = {
@@ -187,6 +209,8 @@ class ProtNoteTrainer:
                     for k, v in item.items()
                 }
                 processed_args.append(processed_dict)
+            elif hasattr(item, "to"):  # PyG Batch
+                processed_args.append(item.to(self.device))
             else:
                 processed_args.append(item)
         return processed_args
@@ -252,41 +276,49 @@ class ProtNoteTrainer:
         :return: batch loss, logits and labels
         :rtype: tuple
         """
-
-        # Unpack the validation or testing batch
-        (
-            sequence_onehots,
-            sequence_lengths,
-            sequence_ids,
-            label_multihots,
-            label_embeddings,
-        ) = (
-            batch["sequence_onehots"],
-            batch["sequence_lengths"],
-            batch["sequence_ids"],
-            batch["label_multihots"],
-            batch["label_embeddings"],
-        )
-
-        # Move all unpacked batch elements to GPU, if available
-        (
-            sequence_onehots,
-            sequence_lengths,
-            label_multihots,
-            label_embeddings,
-        ) = self._to_device(
-            sequence_onehots, sequence_lengths, label_multihots, label_embeddings
-        )
+        if self.use_structural_encoder:
+            structure_batch = batch["structure_batch"]
+            sequence_ids = batch.get("sequence_ids", [])
+            label_multihots = batch["label_multihots"]
+            label_embeddings = batch["label_embeddings"]
+            structure_batch, label_multihots, label_embeddings = self._to_device(
+                structure_batch, label_multihots, label_embeddings
+            )
+            inputs = {
+                "structure_batch": structure_batch,
+                "label_embeddings": label_embeddings,
+            }
+        else:
+            (
+                sequence_onehots,
+                sequence_lengths,
+                sequence_ids,
+                label_multihots,
+                label_embeddings,
+            ) = (
+                batch["sequence_onehots"],
+                batch["sequence_lengths"],
+                batch["sequence_ids"],
+                batch["label_multihots"],
+                batch["label_embeddings"],
+            )
+            (
+                sequence_onehots,
+                sequence_lengths,
+                label_multihots,
+                label_embeddings,
+            ) = self._to_device(
+                sequence_onehots, sequence_lengths, label_multihots, label_embeddings
+            )
+            inputs = {
+                "sequence_onehots": sequence_onehots,
+                "sequence_lengths": sequence_lengths,
+                "label_embeddings": label_embeddings,
+            }
 
         # Forward pass
-        inputs = {
-            "sequence_onehots": sequence_onehots,
-            "sequence_lengths": sequence_lengths,
-            "label_embeddings": label_embeddings,
-        }
         with autocast():
             logits, embeddings = self.model(**inputs, save_embeddings=return_embeddings)
-            # Compute validation loss for the batch
             loss = self.loss_fn(logits, label_multihots.float())
 
         return loss, logits, label_multihots, sequence_ids, embeddings
@@ -686,45 +718,58 @@ class ProtNoteTrainer:
         for batch_idx, batch in enumerate(train_loader):
             self.training_step += 1
 
-            # Unpack the training batch
-            # In training, we use label_token_counts, but in validation and testing, we don't
-            (
-                sequence_onehots,
-                sequence_lengths,
-                label_multihots,
-                label_embeddings,
-                label_token_counts,
-            ) = (
-                batch["sequence_onehots"],
-                batch["sequence_lengths"],
-                batch["label_multihots"],
-                batch["label_embeddings"],
-                batch["label_token_counts"],
-            )
-
-            # Move all unpacked batch elements to GPU, if available
-            (
-                sequence_onehots,
-                sequence_lengths,
-                label_multihots,
-                label_embeddings,
-                label_token_counts,
-            ) = self._to_device(
-                sequence_onehots,
-                sequence_lengths,
-                label_multihots,
-                label_embeddings,
-                label_token_counts,
-            )
+            # Unpack the training batch (structural vs sequence mode)
+            if self.use_structural_encoder:
+                structure_batch = batch["structure_batch"]
+                sequence_ids = batch.get("sequence_ids", [])
+                label_multihots = batch["label_multihots"]
+                label_embeddings = batch["label_embeddings"]
+                label_token_counts = batch["label_token_counts"]
+                structure_batch, label_multihots, label_embeddings, label_token_counts = self._to_device(
+                    structure_batch, label_multihots, label_embeddings, label_token_counts
+                )
+                if self._site_ground_truth is not None and getattr(structure_batch, "plm", None) is not None:
+                    structure_batch.plm.requires_grad_(True)
+                inputs = {
+                    "structure_batch": structure_batch,
+                    "label_embeddings": label_embeddings,
+                    "label_token_counts": label_token_counts,
+                }
+            else:
+                (
+                    sequence_onehots,
+                    sequence_lengths,
+                    label_multihots,
+                    label_embeddings,
+                    label_token_counts,
+                ) = (
+                    batch["sequence_onehots"],
+                    batch["sequence_lengths"],
+                    batch["label_multihots"],
+                    batch["label_embeddings"],
+                    batch["label_token_counts"],
+                )
+                (
+                    sequence_onehots,
+                    sequence_lengths,
+                    label_multihots,
+                    label_embeddings,
+                    label_token_counts,
+                ) = self._to_device(
+                    sequence_onehots,
+                    sequence_lengths,
+                    label_multihots,
+                    label_embeddings,
+                    label_token_counts,
+                )
+                inputs = {
+                    "sequence_onehots": sequence_onehots,
+                    "sequence_lengths": sequence_lengths,
+                    "label_embeddings": label_embeddings,
+                    "label_token_counts": label_token_counts,
+                }
 
             # Forward pass
-            inputs = {
-                "sequence_onehots": sequence_onehots,
-                "sequence_lengths": sequence_lengths,
-                "label_embeddings": label_embeddings,
-                "label_token_counts": label_token_counts,
-            }
-
             with autocast():
                 logits, _ = self.model(**inputs)
 
@@ -733,6 +778,27 @@ class ProtNoteTrainer:
                     self.loss_fn(logits, label_multihots.float())
                     / self.gradient_accumulation_steps
                 )
+
+                # Interpretability loss (IntegratedGradient): MSE between gradient-input attribution and site ground truth
+                if (
+                    self.use_structural_encoder
+                    and self._site_ground_truth is not None
+                    and self.interpretability_method == "integratedgradient"
+                    and getattr(structure_batch, "plm", None) is not None
+                    and structure_batch.plm.requires_grad
+                ):
+                    node_attr = gradient_input_node_attribution_from_logits(
+                        logits, structure_batch, baseline_plm=None, device=self.device
+                    )
+                    interp_loss, _ = interpretability_loss_mse(
+                        node_attr,
+                        structure_batch.batch,
+                        sequence_ids,
+                        self._site_ground_truth,
+                        self.device,
+                        logits_per_sample=logits.sum(dim=1),
+                    )
+                    loss = loss + self.interpretability_weight * interp_loss
 
             # Backward pass with mixed precision
             self.scaler.scale(loss).backward()

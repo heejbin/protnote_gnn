@@ -67,8 +67,9 @@ params:
   LABEL_SMOOTHING: 0.0 # Currently only implemented for FocalLoss
 
   # Sequence and label encoders
+  USE_STRUCTURAL_ENCODER: TRUE  # True: EGNN structural encoder; False: ProteInfer sequence encoder
   PRETRAINED_SEQUENCE_ENCODER: True
-  TRAIN_SEQUENCE_ENCODER: False
+  TRAIN_SEQUENCE_ENCODER: True   # When USE_STRUCTURAL_ENCODER: True, train EGNN (StrucToxNet trains it from scratch). False = freeze structural encoder.
   LABEL_ENCODER_NUM_TRAINABLE_LAYERS: 0
   DISTRIBUTE_LABELS: False
   TRAIN_PROJECTION_HEAD: True
@@ -86,6 +87,11 @@ params:
   USE_RESIDUE_MASKING: False # If True, also use masking to augment sequences. Must then also set AUGMENT_SEQUENCE_PROBABILITY > 0, and TRAIN_SEQUENCE_ENCODER = True
   LABEL_AUGMENTATION_DESCRIPTIONS: name+label # Specifies what descriptions to use during training. # Options are any combination of label, name, and synonym_exact. Must include at least one.
   LABEL_EMBEDDING_NOISING_ALPHA: 20.0 # 0.0 = no noising. Typical ranges are <20. Noising scalar from https://arxiv.org/pdf/2310.05914.pdf
+
+  # Interpretability (Phase 5): none = no interpretability loss; IntegratedGradient = IG + site ground truth MSE
+  INTERPRETABILITY_METHOD: IntegratedGradient  # none | IntegratedGradient
+  INTERPRETABILITY_WEIGHT: 0.1   # weight for interpretability loss (MSE between IG attribution and site-based target)
+  INTERPRETABILITY_N_STEPS: 50   # number of steps for Integrated Gradients approximation
 
   # Constants
   SEED: 42
@@ -110,6 +116,21 @@ embed_sequences_params:
   BOTTLENECK_FACTOR: 0.5
   PROTEINFER_NUM_GO_LABELS: 32102
   PROTEINFER_NUM_EC_LABELS: 5134
+
+# Structural encoder (EGNN) params when USE_STRUCTURAL_ENCODER: True
+structural_encoder_params:
+  # Node features: ProtT5 (StrucToxNet default) or ESM-C (proposal: ESM-C for transfer learning)
+  # PLM_EMBEDDING_DIM is auto-set from PLM_MODEL (ProtT5->1069, ESM-C->1280). Override here if needed.
+  PLM_MODEL: ProtT5   # ProtT5 | ESM-C  (ESM-C = ESM-2 based, e.g. esm2_t33_650M_UR50D)
+  PLM_EMBEDDING_DIM: null   # null = auto from PLM_MODEL; or set 1069 / 1280 to override
+  PROTEIN_EMBEDDING_DIM: 1100  # Must match PROTEIN_EMBEDDING_DIM for ProtNote W_p
+  HIDDEN_NF: 256
+  NUM_LAYERS: 3
+  IN_EDGE_NF: 16
+  DROPOUT: 0.5
+  # Paths (relative to data/); used when loading precomputed graphs/PLM
+  STRUCTURE_GRAPH_DIR: structure_graphs/
+  PLM_CACHE_DIR: plm_cache/
 
 # Paths to data, vocabularies, embeddings, and models
 paths:
@@ -161,7 +182,19 @@ paths:
 
     #SwissProt
     LATEST_SWISSPROT_DATA_PATH: swissprot/uniprot_sprot_jul_2024.dat
-    
+
+    # Structural pipeline (when USE_STRUCTURAL_ENCODER: True)
+    # Proposal: structures from AlphaFoldDB (https://alphafold.ebi.ac.uk/) or AlphaFold 3.
+    # AlphaFoldDB is online; you download structures to a local dir, then point PDB_DIR here.
+    STRUCTURE_SOURCE: local   # local = PDB files already in PDB_DIR; alphafolddb = download from AlphaFoldDB into PDB_DIR first
+    PDB_DIR: pdb/             # Local directory for PDB/mmCIF files. For AlphaFoldDB: run bin/fetch_alphafold_structures.py to download here (sequence_id = UniProt ID).
+    STRUCTURE_GRAPH_DIR: structure_graphs/
+    PLM_CACHE_DIR: plm_cache/
+    STRUCTURE_INDEX_PATH: structure_index.json  # sequence_id (UniProt ID) -> local pdb_path
+    STRUCTURE_GRAPH_PKL: structure_graphs/combined_graph_plm.pkl  # sequence_id -> (x, plm, edge_index, edge_s)
+    # Site ground truth for interpretability (UniProt TSV with Entry, Site columns; Site has "SITE 29; SITE 30; ...")
+    INTERPRETABILITY_SITE_TSV_PATH: annotations/uniprotkb_keyword_KW_0800_site.tsv
+
   # Paths referenced relative to OUTPUT_PATH (will have "outputs" prepended)
   output_paths:
     # Where to save the model

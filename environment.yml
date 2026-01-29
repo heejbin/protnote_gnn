@@ -32,6 +32,8 @@ dependencies:
   - openpyxl=3.1.5
   - pip:
     - pip
+    - torch-scatter
+    - torch-geometric
     - torcheval==0.0.7
     - wget==3.2
     - azureml-mlflow==1.53.0
