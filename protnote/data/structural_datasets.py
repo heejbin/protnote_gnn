@@ -277,6 +277,20 @@ class ProteinStructureDataset(Dataset):
             self.label_token_counts[idx_list],
         )
 
+    def _sample_label_embeddings(self):
+        """Sample one embedding per label (for training with multiple description types)."""
+        label_embedding_idxs_list = []
+        for go_term in self.label_vocabulary:
+            idx = np.random.randint(
+                low=self.label_embeddings_index[go_term]["min_idx"],
+                high=self.label_embeddings_index[go_term]["max_idx"] + 1,
+            )
+            label_embedding_idxs_list.append(idx)
+        return (
+            self.label_embeddings[label_embedding_idxs_list],
+            self.label_token_counts[label_embedding_idxs_list],
+        )
+
     def __len__(self):
         return len(self.data)
 
@@ -312,8 +326,12 @@ class ProteinStructureDataset(Dataset):
             num_classes=len(self.label_vocabulary),
         ).sum(dim=0)
 
-        label_embeddings = self.sorted_label_embeddings
-        label_token_counts = self.sorted_label_token_counts
+        # During training with multiple augmentation descriptions, sample one embedding per label
+        if self.dataset_type == "train" and len(self.label_augmentation_descriptions) > 1:
+            label_embeddings, label_token_counts = self._sample_label_embeddings()
+        else:
+            label_embeddings = self.sorted_label_embeddings
+            label_token_counts = self.sorted_label_token_counts
 
         if self.use_atom_level:
             return self._getitem_atom_level(sequence, sequence_id, label_multihots, label_embeddings, label_token_counts)

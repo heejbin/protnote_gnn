@@ -416,7 +416,7 @@ def train_validate_test(gpu, args):
     if use_hybrid:
         # Structural encoder: ESM-C + EGNN
         sequence_encoder = StructuralProteinEncoder(
-            plm_embedding_dim=params.get("ESMC_EMBEDDING_DIM", 960) + 37,  # ESM-C + atom-type one-hot
+            plm_embedding_dim=params.get("ESMC_EMBEDDING_DIM", 960),  # ESM-C dim only; atom-type added internally
             protein_embedding_dim=params["PROTEIN_EMBEDDING_DIM"],
             hidden_nf=params.get("EGNN_HIDDEN_DIM", 256),
             num_layers=params.get("EGNN_N_LAYERS", 4),
