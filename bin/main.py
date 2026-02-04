@@ -170,7 +170,10 @@ def main():
     )
 
     parser.add_argument(
-        "--use-hybrid-encoder", action="store_true", default=False, help="Use hybrid ESM-C + EGNN encoder instead of ProteInfer CNN."
+        "--use-sequence-encoder",
+        action="store_true",
+        default=False,
+        help="Use legacy ProteInfer CNN sequence encoder instead of hybrid ESM-C + EGNN encoder.",
     )
 
     args = parser.parse_args()
@@ -270,8 +273,10 @@ def train_validate_test(gpu, args):
         raise NotImplementedError("Gradient checkpointing is not yet implemented.")
 
     # ---------------------- DATASETS ----------------------#
-    # Load graph index if using hybrid encoder
-    use_hybrid = args.use_hybrid_encoder
+    # By default use hybrid ESM-C + EGNN encoder; use --use-sequence-encoder for legacy ProteInfer
+    use_hybrid = not args.use_sequence_encoder
+    logger.info(f"Encoder mode: {'Hybrid (ESM-C + EGNN)' if use_hybrid else 'Sequence (ProteInfer CNN)'}")
+
     graph_index = {}
     graph_dir = None
     graph_archive_path = None
@@ -448,6 +453,8 @@ def train_validate_test(gpu, args):
                 num_resnet_blocks=config["embed_sequences_params"]["NUM_RESNET_BLOCKS"],
                 bottleneck_factor=config["embed_sequences_params"]["BOTTLENECK_FACTOR"],
             )
+        pretrained_str = "pretrained" if params["PRETRAINED_SEQUENCE_ENCODER"] else "random init"
+        logger.info(f"Using ProteInfer sequence encoder ({pretrained_str}, output_dim={params['PROTEIN_EMBEDDING_DIM']})")
 
     model = ProtNote(
         # Parameters
