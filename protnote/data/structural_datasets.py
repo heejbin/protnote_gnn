@@ -1,7 +1,12 @@
 """
-Structural dataset: same GO/label format as ProteinDataset but returns PyG Data (graph + PLM) per sample.
-Expects precomputed graph+PLM pkl: dict[sequence_id] -> (x, plm, edge_index, edge_s).
+Structural dataset: same GO/label format as ProteinDataset but returns graph + PLM per sample.
+
+Supports two data formats:
+- Legacy: Precomputed graph+PLM pkl: dict[sequence_id] -> (x, plm, edge_index, edge_s)
+- Atom-level (toxinnote): Graph archive (.pngrph) with ESM-C embeddings
 """
+import os
+import json
 import pickle
 import logging
 from collections import defaultdict
@@ -21,11 +26,18 @@ from protnote.utils.data import read_fasta, get_vocab_mappings
 from protnote.utils.data import generate_vocabularies
 import blosum as bl
 
+# Amino acid to index mapping for vanilla mode
+AA_TO_INDEX = {aa: i + 1 for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY")}  # 1-indexed, 0=unknown
+
 
 class ProteinStructureDataset(Dataset):
     """
     Dataset for structural encoder: each sample is (graph + PLM, labels).
-    Labels and vocabulary match ProteinDataset (GO annotations). Graph+PLM loaded from precomputed pkl.
+    Labels and vocabulary match ProteinDataset (GO annotations).
+
+    Supports two data formats:
+    - Legacy: graph_plm_pkl_path -> pkl mapping sequence_id -> (x, plm, edge_index, edge_s)
+    - Atom-level: graph_dir + graph_index + optional graph_archive_path
     """
 
     def __init__(
@@ -33,26 +45,39 @@ class ProteinStructureDataset(Dataset):
         data_paths: dict,
         config: dict,
         logger=None,
+        label_tokenizer=None,
         graph_plm_pkl_path: str = None,
+        # New params for atom-level format
+        graph_dir: str = None,
+        graph_index: dict = None,
+        graph_archive_path: str = None,
+        use_atom_level: bool = False,
+        split: str = None,
     ):
         """
         data_paths: same as ProteinDataset (data_path, dataset_type, annotations_path, vocabularies_dir).
-        graph_plm_pkl_path: path to pkl mapping sequence_id -> (x, plm, edge_index, edge_s).
-                            Only sequences present in this pkl are kept.
+
+        For legacy format:
+            graph_plm_pkl_path: path to pkl mapping sequence_id -> (x, plm, edge_index, edge_s).
+
+        For atom-level format:
+            graph_dir: Directory containing .pt graph files
+            graph_index: Dict mapping sequence_id -> filename
+            graph_archive_path: Optional path to .pngrph archive
+            use_atom_level: Set True to use atom-level format
+            split: Dataset split (train/validation/test), used for logging
         """
         self.logger = logger or logging.getLogger(__name__)
         required_keys = ["data_path", "dataset_type"]
         for key in required_keys:
             if key not in data_paths:
                 raise ValueError(f"Missing required key in data_paths: {key}")
-        if graph_plm_pkl_path is None:
-            graph_plm_pkl_path = data_paths.get("graph_plm_pkl_path")
-        if not graph_plm_pkl_path:
-            raise ValueError("ProteinStructureDataset requires graph_plm_pkl_path (in data_paths or argument).")
 
         self.dataset_type = data_paths["dataset_type"]
         self.data_path = data_paths["data_path"]
-        self.graph_plm_pkl_path = graph_plm_pkl_path
+        self.use_atom_level = use_atom_level
+        self.label_tokenizer = label_tokenizer
+        self.split = split or self.dataset_type
 
         self.augment_residue_probability = config["params"].get("AUGMENT_RESIDUE_PROBABILITY", 0.0)
         self.label_augmentation_descriptions = config["params"].get("LABEL_AUGMENTATION_DESCRIPTIONS", "name+label").split("+")
@@ -64,16 +89,58 @@ class ProteinStructureDataset(Dataset):
             {aa1: {aa2: blosum62[aa1][aa2] for aa2 in blosum62.keys()} for aa1 in blosum62.keys()},
         )
 
+        # Initialize based on format
+        if use_atom_level:
+            self._init_atom_level(data_paths, config, graph_dir, graph_index, graph_archive_path)
+        else:
+            self._init_legacy(data_paths, config, graph_plm_pkl_path)
+
+    def _init_legacy(self, data_paths, config, graph_plm_pkl_path):
+        """Initialize for legacy pkl format."""
+        if graph_plm_pkl_path is None:
+            graph_plm_pkl_path = data_paths.get("graph_plm_pkl_path")
+        if not graph_plm_pkl_path:
+            raise ValueError("ProteinStructureDataset requires graph_plm_pkl_path for legacy format.")
+
+        self.graph_plm_pkl_path = graph_plm_pkl_path
+
         # Load graph+PLM pkl and restrict to sequences that have structure
         with open(graph_plm_pkl_path, "rb") as f:
             self.graph_plm_pkl = pickle.load(f)
         self.valid_ids = set(self.graph_plm_pkl.keys())
+        self._finish_init(data_paths, config)
+
+    def _init_atom_level(self, data_paths, config, graph_dir, graph_index, graph_archive_path):
+        """Initialize for atom-level graph archive format."""
+        # Get paths from data_paths if not provided directly
+        if graph_dir is None:
+            graph_dir = data_paths.get("graph_dir") or config["paths"].get("GRAPH_DIR")
+        if graph_index is None:
+            graph_index_path = data_paths.get("graph_index_path") or config["paths"].get("GRAPH_INDEX_PATH")
+            if graph_index_path and os.path.exists(graph_index_path):
+                with open(graph_index_path) as f:
+                    graph_index = json.load(f)
+            else:
+                graph_index = {}
+        if graph_archive_path is None:
+            graph_archive_path = data_paths.get("graph_archive_path") or config["paths"].get("GRAPH_ARCHIVE_PATH")
+
+        self.graph_dir = graph_dir
+        self.graph_index = graph_index
+        self.graph_archive_path = graph_archive_path
+        self._archive_reader = None  # Lazy init for DataLoader spawn safety
+
+        self.valid_ids = set(graph_index.keys())
+        self._finish_init(data_paths, config)
+
+    def _finish_init(self, data_paths, config):
 
         # Load FASTA and filter to valid sequence_ids
         raw_data = read_fasta(data_paths["data_path"])
         self.data = [(seq, sid, labels) for (seq, sid, labels) in raw_data if sid in self.valid_ids]
+        mode_str = "atom-level" if self.use_atom_level else "legacy"
         self.logger.info(
-            f"ProteinStructureDataset: {len(self.data)} samples with structure (from {len(raw_data)} in FASTA)."
+            f"ProteinStructureDataset [{self.split}] ({mode_str}): {len(self.data)} samples with structure (from {len(raw_data)} in FASTA)."
         )
 
         subset_fraction = config["params"].get(f"{self.dataset_type.upper()}_SUBSET_FRACTION", 1.0)
@@ -104,6 +171,49 @@ class ProteinStructureDataset(Dataset):
             self.label_descriptions,
         ) = self._process_label_embedding_mapping(mapping=index_mapping, embeddings=emb_tensor)
         self.sorted_label_embeddings, self.sorted_label_token_counts = self._sort_label_embeddings()
+
+    def _get_archive_reader(self):
+        """Lazily initialize the archive reader on first access."""
+        if self._archive_reader is None and hasattr(self, 'graph_archive_path') and self.graph_archive_path:
+            from protnote.utils.graph_archive import GraphArchiveReader
+            self._archive_reader = GraphArchiveReader(self.graph_archive_path)
+        return self._archive_reader
+
+    def _load_graph_atom_level(self, sequence_id, sequence):
+        """Load atom-level graph data for a protein.
+
+        Returns a dict with atom_coords, atom_types, atom_to_residue,
+        esmc_embeddings, edge_index, num_residues, num_atoms.
+        """
+        # Try archive first
+        reader = self._get_archive_reader()
+        if reader is not None and sequence_id in reader:
+            try:
+                return reader[sequence_id]
+            except Exception as e:
+                self.logger.warning(f"Failed to load graph for {sequence_id} from archive: {e}. Trying individual file.")
+
+        # Then try individual file
+        if sequence_id in self.graph_index:
+            graph_path = os.path.join(self.graph_dir, self.graph_index[sequence_id])
+            try:
+                graph_data = torch.load(graph_path, weights_only=False)
+                return graph_data
+            except Exception as e:
+                self.logger.warning(f"Failed to load graph for {sequence_id}: {e}. Using fallback.")
+
+        # Fallback: one virtual atom per residue, no edges
+        num_residues = len(sequence)
+        graph_data = {
+            "coords": torch.zeros(num_residues, 3),
+            "atom_types": torch.zeros(num_residues, dtype=torch.long),
+            "residue_index": torch.arange(num_residues),
+            "esmc_embeddings": torch.zeros(num_residues, 960),
+            "edge_index": torch.zeros(2, 0, dtype=torch.long),
+            "n_residues": num_residues,
+            "n_atoms": num_residues,
+        }
+        return graph_data
 
     def _preprocess_data(self, deduplicate, max_sequence_length, vocabulary_path):
         self.logger.info("Cleaning structural data...")
@@ -203,6 +313,23 @@ class ProteinStructureDataset(Dataset):
 
     def __getitem__(self, idx):
         sequence, sequence_id, labels = self.data[idx]
+
+        labels_ints = [self.label2int[label] for label in labels]
+        label_multihots = torch.nn.functional.one_hot(
+            torch.tensor(labels_ints, dtype=torch.long),
+            num_classes=len(self.label_vocabulary),
+        ).sum(dim=0)
+
+        label_embeddings = self.sorted_label_embeddings
+        label_token_counts = self.sorted_label_token_counts
+
+        if self.use_atom_level:
+            return self._getitem_atom_level(sequence, sequence_id, label_multihots, label_embeddings, label_token_counts)
+        else:
+            return self._getitem_legacy(sequence_id, label_multihots, label_embeddings, label_token_counts)
+
+    def _getitem_legacy(self, sequence_id, label_multihots, label_embeddings, label_token_counts):
+        """Get item for legacy pkl format (residue-level, PyG Data)."""
         x, plm, edge_index, edge_s = self.graph_plm_pkl[sequence_id]
         if not isinstance(x, torch.Tensor):
             x = torch.as_tensor(x, dtype=torch.float32)
@@ -217,18 +344,43 @@ class ProteinStructureDataset(Dataset):
 
         graph_data = Data(x=x, plm=plm, edge_index=edge_index, edge_s=edge_s)
 
-        labels_ints = [self.label2int[label] for label in labels]
-        label_multihots = torch.nn.functional.one_hot(
-            torch.tensor(labels_ints, dtype=torch.long),
-            num_classes=len(self.label_vocabulary),
-        ).sum(dim=0)
-
-        label_embeddings = self.sorted_label_embeddings
-        label_token_counts = self.sorted_label_token_counts
-
         return {
             "structure_batch": graph_data,
             "sequence_id": sequence_id,
+            "label_multihots": label_multihots,
+            "label_embeddings": label_embeddings,
+            "label_token_counts": label_token_counts,
+        }
+
+    def _getitem_atom_level(self, sequence, sequence_id, label_multihots, label_embeddings, label_token_counts):
+        """Get item for atom-level format (ESM-C + atom types)."""
+        graph_data = self._load_graph_atom_level(sequence_id, sequence)
+
+        # Extract fields with consistent naming
+        atom_coords = graph_data.get("coords", graph_data.get("atom_coords"))
+        atom_types = graph_data["atom_types"]
+        atom_to_residue = graph_data.get("residue_index", graph_data.get("atom_to_residue"))
+        esmc_embeddings = graph_data["esmc_embeddings"]
+        edge_index = graph_data["edge_index"]
+        num_residues = graph_data.get("n_residues", graph_data.get("num_residues"))
+        num_atoms = graph_data.get("n_atoms", graph_data.get("num_atoms"))
+
+        # Build per-atom amino acid indices for vanilla mode
+        per_residue_aa = torch.tensor([AA_TO_INDEX.get(aa, 0) for aa in sequence], dtype=torch.long)
+        clamped_res = atom_to_residue.clamp(max=len(sequence) - 1)
+        residue_indices = per_residue_aa[clamped_res]
+
+        return {
+            "atom_coords": atom_coords,
+            "atom_types": atom_types,
+            "atom_to_residue": atom_to_residue,
+            "esmc_embeddings": esmc_embeddings,
+            "edge_index": edge_index,
+            "num_residues": num_residues,
+            "num_atoms": num_atoms,
+            "residue_indices": residue_indices,
+            "sequence_id": sequence_id,
+            "sequence_str": sequence,
             "label_multihots": label_multihots,
             "label_embeddings": label_embeddings,
             "label_token_counts": label_token_counts,

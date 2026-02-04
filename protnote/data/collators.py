@@ -16,10 +16,43 @@ def collate_structure_batch(
     grid_sampler=False,
     world_size=1,
     rank=0,
+    return_label_multihots=True,
 ):
     """
-    Collate for structural encoder: list of dicts with structure_batch (PyG Data), label_multihots, etc.
-    Returns dict with structure_batch (PyG Batch), sequence_ids, label_multihots, label_embeddings, label_token_counts.
+    Collate for structural encoder. Supports two formats:
+
+    Legacy format (PyG):
+        Input items have 'structure_batch' (PyG Data)
+        Returns dict with 'structure_batch' (PyG Batch)
+
+    Atom-level format (toxinnote):
+        Input items have 'atom_coords', 'atom_types', 'esmc_embeddings', etc.
+        Returns dict with batched tensors + 'graph_data' dict for encoder
+    """
+    # Detect format based on first item
+    if "structure_batch" in batch[0]:
+        return _collate_legacy(batch, label_sample_size, distribute_labels,
+                               shuffle_labels, in_batch_sampling, grid_sampler,
+                               world_size, rank)
+    else:
+        return _collate_atom_level(batch, label_sample_size, distribute_labels,
+                                   shuffle_labels, in_batch_sampling, grid_sampler,
+                                   world_size, rank, return_label_multihots)
+
+
+def _collate_legacy(
+    batch: List[dict],
+    label_sample_size=None,
+    distribute_labels=False,
+    shuffle_labels=False,
+    in_batch_sampling=False,
+    grid_sampler=False,
+    world_size=1,
+    rank=0,
+):
+    """
+    Collate for legacy PyG format: list of dicts with structure_batch (PyG Data).
+    Returns dict with structure_batch (PyG Batch), sequence_ids, label_multihots, etc.
     """
     if PyGBatch is None:
         raise ImportError("collate_structure_batch requires torch_geometric: pip install torch-geometric")
@@ -59,6 +92,136 @@ def collate_structure_batch(
         "label_embeddings": label_embeddings,
         "label_token_counts": label_token_counts,
     }
+
+
+def _collate_atom_level(
+    batch: List[dict],
+    label_sample_size=None,
+    distribute_labels=False,
+    shuffle_labels=False,
+    in_batch_sampling=False,
+    grid_sampler=False,
+    world_size=1,
+    rank=0,
+    return_label_multihots=True,
+):
+    """
+    Collate for atom-level format (toxinnote): batches atom-level graphs.
+
+    Returns dict with:
+        - graph_data: dict for encoder (esmc_embeddings, atom_coords, atom_types,
+                      edge_index, atom_to_protein, num_proteins)
+        - sequence_ids, label_multihots, label_embeddings, label_token_counts
+    """
+    # Batch graph data (PyG-style: concatenate with offsets)
+    all_atom_coords = []
+    all_atom_types = []
+    all_esmc_embeddings = []
+    all_residue_indices = []
+    all_edge_index = []
+    all_atom_to_protein = []
+    sequence_ids = []
+
+    atom_offset = 0
+
+    for i, item in enumerate(batch):
+        n_atoms = item["num_atoms"]
+
+        all_atom_coords.append(item["atom_coords"])
+        all_atom_types.append(item["atom_types"])
+
+        # Broadcast esmc_embeddings from per-residue to per-atom if needed
+        esmc_emb = item["esmc_embeddings"]
+        atom_to_res = item["atom_to_residue"]
+        if esmc_emb.size(0) != n_atoms:
+            # Per-residue format: broadcast to atoms
+            esmc_emb_per_atom = esmc_emb[atom_to_res]
+        else:
+            esmc_emb_per_atom = esmc_emb
+        all_esmc_embeddings.append(esmc_emb_per_atom)
+
+        if "residue_indices" in item:
+            all_residue_indices.append(item["residue_indices"])
+
+        # Offset edge indices by cumulative atom count
+        edge_index = item["edge_index"]
+        if edge_index.numel() > 0:
+            all_edge_index.append(edge_index + atom_offset)
+        else:
+            all_edge_index.append(edge_index)
+
+        # Track which atoms belong to which protein
+        all_atom_to_protein.append(torch.full((n_atoms,), i, dtype=torch.long))
+
+        sequence_ids.append(item["sequence_id"])
+        atom_offset += n_atoms
+
+    # Concatenate all tensors
+    batched_atom_coords = torch.cat(all_atom_coords, dim=0)
+    batched_atom_types = torch.cat(all_atom_types, dim=0)
+    batched_esmc_embeddings = torch.cat(all_esmc_embeddings, dim=0)
+    batched_atom_to_protein = torch.cat(all_atom_to_protein, dim=0)
+
+    if any(e.numel() > 0 for e in all_edge_index):
+        non_empty = [e for e in all_edge_index if e.numel() > 0]
+        batched_edge_index = torch.cat(non_empty, dim=1) if non_empty else torch.zeros(2, 0, dtype=torch.long)
+    else:
+        batched_edge_index = torch.zeros(2, 0, dtype=torch.long)
+
+    batched_residue_indices = None
+    if all_residue_indices:
+        batched_residue_indices = torch.cat(all_residue_indices, dim=0)
+
+    # Build graph_data dict for encoder
+    graph_data = {
+        "esmc_embeddings": batched_esmc_embeddings,
+        "atom_coords": batched_atom_coords,
+        "atom_types": batched_atom_types,
+        "edge_index": batched_edge_index,
+        "atom_to_protein": batched_atom_to_protein,
+        "num_proteins": len(batch),
+    }
+    if batched_residue_indices is not None:
+        graph_data["residue_indices"] = batched_residue_indices
+
+    # Handle labels
+    label_multihots = torch.stack([item["label_multihots"] for item in batch])
+    label_embeddings = batch[0]["label_embeddings"]
+    label_token_counts = batch[0]["label_token_counts"]
+
+    # Label sampling (same logic as legacy)
+    sampled_label_indices = None
+    if label_sample_size and not grid_sampler and not in_batch_sampling:
+        num_labels = label_multihots.shape[1]
+        if distribute_labels:
+            labels_per_partition = num_labels // world_size
+            start_idx = rank * labels_per_partition
+            end_idx = start_idx + labels_per_partition
+            sampled_label_indices = torch.arange(start_idx, end_idx)[: label_sample_size // world_size]
+        else:
+            sampled_label_indices = (
+                torch.randperm(num_labels)[:label_sample_size]
+                if shuffle_labels
+                else torch.arange(min(label_sample_size, num_labels))
+            )
+    elif in_batch_sampling:
+        sampled_label_indices = torch.where(label_multihots.sum(dim=0) > 0)[0]
+
+    if sampled_label_indices is not None:
+        label_embeddings = label_embeddings[sampled_label_indices]
+        label_multihots = label_multihots[:, sampled_label_indices]
+        label_token_counts = label_token_counts[sampled_label_indices]
+
+    result = {
+        "graph_data": graph_data,
+        "sequence_ids": sequence_ids,
+        "label_embeddings": label_embeddings,
+        "label_token_counts": label_token_counts,
+    }
+    if return_label_multihots:
+        result["label_multihots"] = label_multihots
+
+    return result
 
 
 def collate_variable_sequence_length(
