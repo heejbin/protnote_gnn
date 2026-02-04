@@ -12,7 +12,7 @@ from tqdm import tqdm
 from protnote.utils.configs import load_config
 
 config, project_root = load_config()
-datapath_remote = config["paths"]["remote_data"]
+datapath_remote = config["remote_data"]
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
