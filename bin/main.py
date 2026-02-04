@@ -9,14 +9,16 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModel, AutoTokenizer
 
 import wandb
-from protnote.data.collators import collate_structure_batch
 from protnote.data.datasets import (
     ProteinDataset,
-    StructureProteinDataset,
     calculate_sequence_weights,
     create_multiple_loaders,
 )
-from protnote.models.hybrid_encoders import HybridProteinEncoder
+from protnote.data.structural_datasets import (
+    ProteinStructureDataset,
+    create_structural_loaders,
+)
+from protnote.models.egnn import StructuralProteinEncoder
 from protnote.models.protein_encoders import ProteInfer
 from protnote.models.ProtNote import ProtNote
 from protnote.models.ProtNoteTrainer import ProtNoteTrainer
@@ -173,7 +175,7 @@ def main():
         "--use-sequence-encoder",
         action="store_true",
         default=False,
-        help="Use legacy ProteInfer CNN sequence encoder instead of hybrid ESM-C + EGNN encoder.",
+        help="Use legacy ProteInfer sequence encoder instead of hybrid ESM-C + EGNN encoder (default).",
     )
 
     args = parser.parse_args()
@@ -273,10 +275,10 @@ def train_validate_test(gpu, args):
         raise NotImplementedError("Gradient checkpointing is not yet implemented.")
 
     # ---------------------- DATASETS ----------------------#
-    # By default use hybrid ESM-C + EGNN encoder; use --use-sequence-encoder for legacy ProteInfer
+    # Determine encoder mode: hybrid (default) or sequence (legacy ProteInfer)
     use_hybrid = not args.use_sequence_encoder
-    logger.info(f"Encoder mode: {'Hybrid (ESM-C + EGNN)' if use_hybrid else 'Sequence (ProteInfer CNN)'}")
 
+    # Load graph index if using hybrid encoder
     graph_index = {}
     graph_dir = None
     graph_archive_path = None
@@ -301,20 +303,29 @@ def train_validate_test(gpu, args):
             logger.info(f"Using graph archive: {graph_archive_path}")
 
     # Select dataset class
-    DatasetClass = StructureProteinDataset if use_hybrid else ProteinDataset
+    DatasetClass = ProteinStructureDataset if use_hybrid else ProteinDataset
 
     def _make_dataset(data_paths, require_label_idxs):
-        kwargs = dict(
-            data_paths=data_paths,
-            config=config,
-            logger=logger,
-            require_label_idxs=require_label_idxs,
-            label_tokenizer=label_tokenizer,
-        )
         if use_hybrid:
-            kwargs["graph_dir"] = graph_dir
-            kwargs["graph_index"] = graph_index
-            kwargs["graph_archive_path"] = graph_archive_path
+            # ProteinStructureDataset doesn't support require_label_idxs
+            kwargs = dict(
+                data_paths=data_paths,
+                config=config,
+                logger=logger,
+                label_tokenizer=label_tokenizer,
+                graph_dir=graph_dir,
+                graph_index=graph_index,
+                graph_archive_path=graph_archive_path,
+                use_atom_level=True,
+            )
+        else:
+            kwargs = dict(
+                data_paths=data_paths,
+                config=config,
+                logger=logger,
+                require_label_idxs=require_label_idxs,
+                label_tokenizer=label_tokenizer,
+            )
         return DatasetClass(**kwargs)
 
     # Create individual datasets
@@ -350,9 +361,12 @@ def train_validate_test(gpu, args):
     # Calculate the weighting for the train dataset
     sequence_weights = None
     if params["WEIGHTED_SAMPLING"] & (args.train_path_name is not None):
-        # Calculate label weights
+        # Calculate label weights (need dict format for calculate_sequence_weights)
         logger.info("Calculating label weights for weighted sampling...")
-        label_weights = datasets["train"][0].calculate_label_weights(power=params["INV_FREQUENCY_POWER"])
+        label_weights = datasets["train"][0].calculate_label_weights(
+            power=params["INV_FREQUENCY_POWER"],
+            return_list=False,  # Need dict format for calculate_sequence_weights
+        )
 
         # Calculate sequence weights
         logger.info("Calculating sequence weights based on the label weights...")
@@ -369,67 +383,49 @@ def train_validate_test(gpu, args):
             sequence_weights = [min(x, params["SAMPLING_UPPER_CLAMP_BOUND"]) for x in sequence_weights]
 
     logger.info("Initializing data loaders...")
-    # Define data loaders
-    loaders = create_multiple_loaders(
-        datasets,
-        params,
-        label_sample_sizes=label_sample_sizes,
-        shuffle_labels=params["SHUFFLE_LABELS"],
-        in_batch_sampling=params["IN_BATCH_SAMPLING"],
-        grid_sampler=params["GRID_SAMPLER"],
-        num_workers=params["NUM_WORKERS"],
-        world_size=args.world_size,
-        rank=rank,
-        sequence_weights=sequence_weights,
-        collate_fn_override=collate_structure_batch if use_hybrid else None,
-    )
-
-    # Initialize ProteInfer
-    if params["PRETRAINED_SEQUENCE_ENCODER"] & (args.model_file is None):
-        sequence_encoder = ProteInfer.from_pretrained(
-            weights_path=paths[f"PROTEINFER_{task}_WEIGHTS_PATH"],
-            num_labels=config["embed_sequences_params"]["PROTEINFER_NUM_GO_LABELS"],
-            input_channels=config["embed_sequences_params"]["INPUT_CHANNELS"],
-            output_channels=config["embed_sequences_params"]["OUTPUT_CHANNELS"],
-            kernel_size=config["embed_sequences_params"]["KERNEL_SIZE"],
-            activation=torch.nn.ReLU,
-            dilation_base=config["embed_sequences_params"]["DILATION_BASE"],
-            num_resnet_blocks=config["embed_sequences_params"]["NUM_RESNET_BLOCKS"],
-            bottleneck_factor=config["embed_sequences_params"]["BOTTLENECK_FACTOR"],
+    # Define data loaders - use appropriate loader factory based on encoder type
+    if use_hybrid:
+        loaders = create_structural_loaders(
+            datasets,
+            params,
+            label_sample_sizes=label_sample_sizes,
+            shuffle_labels=params["SHUFFLE_LABELS"],
+            in_batch_sampling=params["IN_BATCH_SAMPLING"],
+            num_workers=params["NUM_WORKERS"],
+            world_size=args.world_size,
+            rank=rank,
+            sequence_weights=sequence_weights,
         )
     else:
-        sequence_encoder = ProteInfer(
-            num_labels=config["embed_sequences_params"]["PROTEINFER_NUM_GO_LABELS"],
-            input_channels=config["embed_sequences_params"]["INPUT_CHANNELS"],
-            output_channels=config["embed_sequences_params"]["OUTPUT_CHANNELS"],
-            kernel_size=config["embed_sequences_params"]["KERNEL_SIZE"],
-            activation=torch.nn.ReLU,
-            dilation_base=config["embed_sequences_params"]["DILATION_BASE"],
-            num_resnet_blocks=config["embed_sequences_params"]["NUM_RESNET_BLOCKS"],
-            bottleneck_factor=config["embed_sequences_params"]["BOTTLENECK_FACTOR"],
+        loaders = create_multiple_loaders(
+            datasets,
+            params,
+            label_sample_sizes=label_sample_sizes,
+            shuffle_labels=params["SHUFFLE_LABELS"],
+            in_batch_sampling=params["IN_BATCH_SAMPLING"],
+            grid_sampler=params["GRID_SAMPLER"],
+            num_workers=params["NUM_WORKERS"],
+            world_size=args.world_size,
+            rank=rank,
+            sequence_weights=sequence_weights,
         )
 
-    # Initialize protein encoder (ProteInfer or Hybrid)
+    # Initialize protein encoder (ProteInfer or StructuralProteinEncoder)
     sequence_encoder = None
-    hybrid_encoder = None
-    encoder_type = "proteinfer"
 
     if use_hybrid:
-        encoder_type = "hybrid"
-        use_plm = params.get("USE_PLM_EMBEDDINGS", True)
-        hybrid_encoder = HybridProteinEncoder(
-            esmc_embedding_dim=params.get("ESMC_EMBEDDING_DIM", 960),
+        # Structural encoder: ESM-C + EGNN
+        sequence_encoder = StructuralProteinEncoder(
+            plm_embedding_dim=params.get("ESMC_EMBEDDING_DIM", 960) + 37,  # ESM-C + atom-type one-hot
+            protein_embedding_dim=params["PROTEIN_EMBEDDING_DIM"],
+            hidden_nf=params.get("EGNN_HIDDEN_DIM", 256),
+            num_layers=params.get("EGNN_N_LAYERS", 4),
             atom_type_dim=37,
-            egnn_hidden_dim=params.get("EGNN_HIDDEN_DIM", 256),
-            egnn_out_dim=params.get("EGNN_OUT_DIM", 256),
-            egnn_n_layers=params.get("EGNN_N_LAYERS", 4),
-            output_dim=params["PROTEIN_EMBEDDING_DIM"],
-            use_plm=use_plm,
-            learned_aa_embedding_dim=params.get("LEARNED_AA_EMBEDDING_DIM", 128),
+            use_atom_level=True,
         )
-        plm_mode = "ESM-C" if use_plm else f"learned AA embedding (dim={params.get('LEARNED_AA_EMBEDDING_DIM', 128)})"
-        logger.info(f"Using hybrid encoder: {plm_mode} + EGNN (output_dim={params['PROTEIN_EMBEDDING_DIM']})")
+        logger.info(f"Using structural encoder: ESM-C + EGNN (output_dim={params['PROTEIN_EMBEDDING_DIM']})")
     else:
+        # Legacy ProteInfer sequence encoder
         if params["PRETRAINED_SEQUENCE_ENCODER"] & (args.model_file is None):
             sequence_encoder = ProteInfer.from_pretrained(
                 weights_path=paths[f"PROTEINFER_{task}_WEIGHTS_PATH"],
@@ -453,8 +449,7 @@ def train_validate_test(gpu, args):
                 num_resnet_blocks=config["embed_sequences_params"]["NUM_RESNET_BLOCKS"],
                 bottleneck_factor=config["embed_sequences_params"]["BOTTLENECK_FACTOR"],
             )
-        pretrained_str = "pretrained" if params["PRETRAINED_SEQUENCE_ENCODER"] else "random init"
-        logger.info(f"Using ProteInfer sequence encoder ({pretrained_str}, output_dim={params['PROTEIN_EMBEDDING_DIM']})")
+        logger.info("Using legacy ProteInfer sequence encoder")
 
     model = ProtNote(
         # Parameters
@@ -468,8 +463,6 @@ def train_validate_test(gpu, args):
         # Encoders
         label_encoder=label_encoder,
         sequence_encoder=sequence_encoder,
-        hybrid_encoder=hybrid_encoder,
-        encoder_type=encoder_type,
         inference_descriptions_per_label=len(params["INFERENCE_GO_DESCRIPTIONS"].split("+")),
         # Output Layer
         output_mlp_hidden_dim_scale_factor=params["OUTPUT_MLP_HIDDEN_DIM_SCALE_FACTOR"],
@@ -680,7 +673,6 @@ def train_validate_test(gpu, args):
 
     ####### CLEANUP #######
 
-    logger.info(f"\n{'=' * 100}\nTraining, validating, and testing COMPLETE\n{'=' * 100}\n")
     logger.info(f"\n{'=' * 100}\nTraining, validating, and testing COMPLETE\n{'=' * 100}\n")
     # W&B, MLFlow amd optional metric results saving
     if is_master:
