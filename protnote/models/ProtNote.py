@@ -171,6 +171,7 @@ class ProtNote(nn.Module):
         sequence_embeddings=None,
         sequence_lengths=None,
         structure_batch=None,
+        graph_data=None,
         tokenized_labels=None,
         label_embeddings=None,
         label_token_counts=None,
@@ -184,6 +185,7 @@ class ProtNote(nn.Module):
             sequence_embeddings (optional): Tensor of pre-trained sequence embeddings.
             sequence_lengths (optional): Tensor of sequence lengths.
             structure_batch (optional): PyG Batch for structural encoder (x, plm, edge_index, edge_s, batch).
+            graph_data (optional): Dict for atom-level structural encoder (toxinnote format).
             tokenized_labels (optional): List of tokenized label sequences.
             label_embeddings (optional): Tensor of pre-trained label embeddings.
         """
@@ -247,6 +249,13 @@ class ProtNote(nn.Module):
         ):
             # If sequence embeddings are provided and we don't need to propagate gradients (either because we aren't in training, or we didn't freeze the weights), use them.
             P_f = sequence_embeddings
+        elif graph_data is not None:
+            # Atom-level structural encoder (toxinnote format): dict -> get_embeddings(**dict)
+            if self.train_sequence_encoder and self.training:
+                P_f = self.sequence_encoder.get_embeddings(**graph_data)
+            else:
+                with torch.no_grad():
+                    P_f = self.sequence_encoder.get_embeddings(**graph_data)
         elif structure_batch is not None:
             # Structural encoder: PyG Batch -> get_embeddings(batch) -> (N, protein_embedding_dim)
             if self.train_sequence_encoder and self.training:
@@ -268,7 +277,7 @@ class ProtNote(nn.Module):
         else:
             raise ValueError(
                 "Incompatible sequence/structure parameters passed to forward method. "
-                "Provide either (sequence_onehots, sequence_lengths), structure_batch, or sequence_embeddings."
+                "Provide either (sequence_onehots, sequence_lengths), structure_batch, graph_data, or sequence_embeddings."
             )
 
         if self.label_embedding_pooling_method == "all":
