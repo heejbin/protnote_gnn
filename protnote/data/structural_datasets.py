@@ -294,7 +294,8 @@ class ProteinStructureDataset(Dataset):
             weights = weights / weights.sum()
         if return_list:
             return torch.tensor(weights, dtype=torch.float32)
-        return weights
+        # Return dict mapping label names to weights (same as ProteinDataset)
+        return {label: weights[i] for i, label in enumerate(self.label_vocabulary)}
 
     def calculate_pos_weight(self):
         """Same interface as ProteinDataset.calculate_pos_weight for BCE."""
