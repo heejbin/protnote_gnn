@@ -2,11 +2,12 @@
 E(3) Equivariant GNN for structural protein encoding.
 Ported from StrucToxNet (Jiao et al.) for use as ProtNote's protein branch.
 
-Updated to support atom-level graphs with ESM-C embeddings (toxinnote format).
+Updated to support atom-level graphs with ESM-C embeddings.
 """
+
 import torch
-from torch import nn
 import torch.nn.functional as F
+from torch import nn
 
 try:
     import torch_scatter
@@ -121,7 +122,7 @@ class E_GCL(nn.Module):
     def coord2radial(self, edge_index, coord):
         row, col = edge_index[0], edge_index[1]
         coord_diff = coord[row] - coord[col]
-        radial = torch.sum(coord_diff ** 2, 1).unsqueeze(1)
+        radial = torch.sum(coord_diff**2, 1).unsqueeze(1)
         if self.normalize:
             norm = torch.sqrt(radial).detach() + self.epsilon
             coord_diff = coord_diff / norm
@@ -184,20 +185,22 @@ class StructuralProteinEncoder(nn.Module):
             self.in_edge_nf = in_edge_nf
 
         self.W_v = nn.Linear(in_node_dim, hidden_nf, bias=True)
-        self.gcl_layers = nn.ModuleList([
-            E_GCL(
-                hidden_nf,
-                hidden_nf,
-                hidden_nf,
-                edges_in_d=self.in_edge_nf,
-                act_fn=act_fn,
-                residual=residual,
-                attention=attention,
-                normalize=normalize,
-                tanh=tanh,
-            )
-            for _ in range(num_layers)
-        ])
+        self.gcl_layers = nn.ModuleList(
+            [
+                E_GCL(
+                    hidden_nf,
+                    hidden_nf,
+                    hidden_nf,
+                    edges_in_d=self.in_edge_nf,
+                    act_fn=act_fn,
+                    residual=residual,
+                    attention=attention,
+                    normalize=normalize,
+                    tanh=tanh,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         # Map pooled hidden_nf -> protein_embedding_dim (e.g. 1100 for ProtNote W_p)
         self.projection = nn.Sequential(
             nn.Linear(hidden_nf, 256),
@@ -230,7 +233,7 @@ class StructuralProteinEncoder(nn.Module):
         **kwargs,
     ):
         """
-        Forward pass for atom-level graph data (toxinnote format).
+        Forward pass for atom-level graph data.
 
         Args:
             esmc_embeddings: Per-atom ESM-C embeddings [N_atoms, esmc_dim]
@@ -272,7 +275,7 @@ class StructuralProteinEncoder(nn.Module):
         For legacy PyG Batch:
             get_embeddings(batch) where batch has .x, .plm, .edge_index, .edge_s, .batch
 
-        For atom-level dict (toxinnote format):
+        For atom-level dict:
             get_embeddings(esmc_embeddings=..., atom_coords=..., atom_types=...,
                           edge_index=..., atom_to_protein=..., num_proteins=...)
         """

@@ -1,9 +1,11 @@
+import math
+
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch
-from protnote.utils.models import get_label_embeddings
 from torchvision.ops import MLP
-import math
+
+from protnote.utils.models import get_label_embeddings
 
 
 class ProtNote(nn.Module):
@@ -62,9 +64,7 @@ class ProtNote(nn.Module):
         # Projection heads
         self.W_p = MLP(
             protein_embedding_dim,
-            [latent_dim * projection_head_hidden_dim_scale_factor]
-            * (projection_head_num_layers - 1)
-            + [latent_dim],
+            [latent_dim * projection_head_hidden_dim_scale_factor] * (projection_head_num_layers - 1) + [latent_dim],
             bias=False,
             norm_layer=torch.nn.BatchNorm1d,
             dropout=dropout,
@@ -72,9 +72,7 @@ class ProtNote(nn.Module):
 
         self.W_l = MLP(
             label_embedding_dim,
-            [latent_dim * projection_head_hidden_dim_scale_factor]
-            * (projection_head_num_layers - 1)
-            + [latent_dim],
+            [latent_dim * projection_head_hidden_dim_scale_factor] * (projection_head_num_layers - 1) + [latent_dim],
             bias=False,
             norm_layer=torch.nn.BatchNorm1d,
             dropout=dropout,
@@ -117,9 +115,7 @@ class ProtNote(nn.Module):
 
         joint_embeddings = torch.cat(
             [
-                P_e[:, None, :].expand(
-                    num_sequences, num_labels, sequence_embedding_dim
-                ),
+                P_e[:, None, :].expand(num_sequences, num_labels, sequence_embedding_dim),
                 L_e[None, :, :].expand(num_sequences, num_labels, label_embedding_dim),
             ],
             dim=2,
@@ -129,10 +125,7 @@ class ProtNote(nn.Module):
             joint_embeddings = torch.cat(
                 [
                     joint_embeddings,
-                    (
-                        joint_embeddings[:, :sequence_embedding_dim]
-                        - joint_embeddings[:, sequence_embedding_dim:]
-                    ),
+                    (joint_embeddings[:, :sequence_embedding_dim] - joint_embeddings[:, sequence_embedding_dim:]),
                 ],
                 dim=-1,
             )
@@ -141,10 +134,7 @@ class ProtNote(nn.Module):
             joint_embeddings = torch.cat(
                 [
                     joint_embeddings,
-                    (
-                        joint_embeddings[:, :sequence_embedding_dim]
-                        * joint_embeddings[:, sequence_embedding_dim:]
-                    ),
+                    (joint_embeddings[:, :sequence_embedding_dim] * joint_embeddings[:, sequence_embedding_dim:]),
                 ],
                 dim=-1,
             )
@@ -155,9 +145,7 @@ class ProtNote(nn.Module):
         raw_attn_scores = self.raw_attn_scorer(hidden_states).squeeze(-1)
 
         # Masked scored for softmax
-        raw_attn_scores = raw_attn_scores.masked_fill(
-            attention_mask == 0, float("-inf")
-        )
+        raw_attn_scores = raw_attn_scores.masked_fill(attention_mask == 0, float("-inf"))
 
         # Normalized attention weights
         attn_weights = torch.softmax(raw_attn_scores, dim=-1)
@@ -185,7 +173,7 @@ class ProtNote(nn.Module):
             sequence_embeddings (optional): Tensor of pre-trained sequence embeddings.
             sequence_lengths (optional): Tensor of sequence lengths.
             structure_batch (optional): PyG Batch for structural encoder (x, plm, edge_index, edge_s, batch).
-            graph_data (optional): Dict for atom-level structural encoder (toxinnote format).
+            graph_data (optional): Dict for atom-level structural encoder.
             tokenized_labels (optional): List of tokenized label sequences.
             label_embeddings (optional): Tensor of pre-trained label embeddings.
         """
@@ -193,9 +181,7 @@ class ProtNote(nn.Module):
         # TODO: Remove sequence_embeddings and tokenized_labels from this code. They are not used. We always use the label_embeddings and sequence_onehots.
 
         # ---------------------- LABEL EMBEDDING ----------------------#
-        if label_embeddings is not None and (
-            self.label_encoder_num_trainable_layers == 0 or not self.training
-        ):
+        if label_embeddings is not None and (self.label_encoder_num_trainable_layers == 0 or not self.training):
             # If label embeddings are provided and we don't need to propagate gradients (either because we aren't in training, or we didn't freeze the weights), use them.
             L_f = label_embeddings
         elif (tokenized_labels is not None) and self.training:
@@ -220,17 +206,11 @@ class ProtNote(nn.Module):
         else:
             raise ValueError("Incompatible label parameters passed to forward method.")
         # Noise the label embedding during training
-        if (
-            self.training
-            and label_token_counts is not None
-            and self.label_embedding_noising_alpha > 0
-        ):
+        if self.training and label_token_counts is not None and self.label_embedding_noising_alpha > 0:
             # scaling the entire noise vector by a factor of α/√(Ld)
             # L is the sequence length, d is the embedding dimension, and α is a tunable parameter
             # denominator = torch.sqrt(label_token_counts * L_f.shape[1])
-            denominator = torch.tensor(
-                math.sqrt(L_f.shape[1]), device=L_f.device, dtype=L_f.dtype
-            )
+            denominator = torch.tensor(math.sqrt(L_f.shape[1]), device=L_f.device, dtype=L_f.dtype)
             scalars = self.label_embedding_noising_alpha / denominator
 
             # Generate random noise of the same shape as L_f (the label embeddings)
@@ -244,13 +224,11 @@ class ProtNote(nn.Module):
             L_f = L_f + scaled_noise
 
         # ---------------------- PROTEIN (SEQUENCE / STRUCTURE) EMBEDDINGS ----------------------#
-        if sequence_embeddings is not None and (
-            not self.train_sequence_encoder or not self.training
-        ):
+        if sequence_embeddings is not None and (not self.train_sequence_encoder or not self.training):
             # If sequence embeddings are provided and we don't need to propagate gradients (either because we aren't in training, or we didn't freeze the weights), use them.
             P_f = sequence_embeddings
         elif graph_data is not None:
-            # Atom-level structural encoder (toxinnote format): dict -> get_embeddings(**dict)
+            # Atom-level structural encoder: dict -> get_embeddings(**dict)
             if self.train_sequence_encoder and self.training:
                 P_f = self.sequence_encoder.get_embeddings(**graph_data)
             else:
@@ -266,14 +244,10 @@ class ProtNote(nn.Module):
         elif sequence_onehots is not None and sequence_lengths is not None:
             # Sequence encoder (ProteInfer): onehots + lengths -> get_embeddings
             if self.train_sequence_encoder and self.training:
-                P_f = self.sequence_encoder.get_embeddings(
-                    sequence_onehots, sequence_lengths
-                )
+                P_f = self.sequence_encoder.get_embeddings(sequence_onehots, sequence_lengths)
             else:
                 with torch.no_grad():
-                    P_f = self.sequence_encoder.get_embeddings(
-                        sequence_onehots, sequence_lengths
-                    )
+                    P_f = self.sequence_encoder.get_embeddings(sequence_onehots, sequence_lengths)
         else:
             raise ValueError(
                 "Incompatible sequence/structure parameters passed to forward method. "
@@ -301,9 +275,7 @@ class ProtNote(nn.Module):
             logits = torch.mm(P_e, L_e.t()) / self.temperature
 
         elif self.feature_fusion.startswith("concatenation"):
-            joint_embeddings = self._get_joint_embeddings(
-                P_e, L_e, num_sequences, num_labels
-            )
+            joint_embeddings = self._get_joint_embeddings(P_e, L_e, num_sequences, num_labels)
             # Feed through MLP to get logits
 
             if not save_embeddings:
@@ -312,9 +284,7 @@ class ProtNote(nn.Module):
                 output_layer_embeddings = joint_embeddings
                 for i, layer in enumerate(self.output_layer):
                     output_layer_embeddings = layer(output_layer_embeddings)
-                    if (
-                        i == len(self.output_layer) - 2
-                    ):  # Check if this is the layer before the last layer
+                    if i == len(self.output_layer) - 2:  # Check if this is the layer before the last layer
                         break
                 logits = self.output_layer[-1](output_layer_embeddings)
 
@@ -344,9 +314,7 @@ class ProtNote(nn.Module):
             if joint_embeddings is not None:
                 embeddings["joint_embeddings"] = joint_embeddings.detach().cpu()
             if output_layer_embeddings is not None:
-                embeddings[
-                    "output_layer_embeddings"
-                ] = output_layer_embeddings.detach().cpu()
+                embeddings["output_layer_embeddings"] = output_layer_embeddings.detach().cpu()
 
         return logits, embeddings
 
@@ -374,9 +342,7 @@ def get_mlp(
         if idx == 0:
             layers.append(nn.Linear(input_dim, hidden_dim, bias=add_hidden_layers_bias))
         else:
-            layers.append(
-                nn.Linear(hidden_dim, hidden_dim, bias=add_hidden_layers_bias)
-            )
+            layers.append(nn.Linear(hidden_dim, hidden_dim, bias=add_hidden_layers_bias))
 
         if batch_norm:
             layers.append(nn.BatchNorm1d(hidden_dim))

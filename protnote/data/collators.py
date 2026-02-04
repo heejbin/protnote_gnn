@@ -1,5 +1,6 @@
-import torch
 from typing import List, Tuple
+
+import torch
 
 try:
     from torch_geometric.data import Batch as PyGBatch
@@ -25,19 +26,27 @@ def collate_structure_batch(
         Input items have 'structure_batch' (PyG Data)
         Returns dict with 'structure_batch' (PyG Batch)
 
-    Atom-level format (toxinnote):
+    Atom-level format:
         Input items have 'atom_coords', 'atom_types', 'esmc_embeddings', etc.
         Returns dict with batched tensors + 'graph_data' dict for encoder
     """
     # Detect format based on first item
     if "structure_batch" in batch[0]:
-        return _collate_legacy(batch, label_sample_size, distribute_labels,
-                               shuffle_labels, in_batch_sampling, grid_sampler,
-                               world_size, rank)
+        return _collate_legacy(
+            batch, label_sample_size, distribute_labels, shuffle_labels, in_batch_sampling, grid_sampler, world_size, rank
+        )
     else:
-        return _collate_atom_level(batch, label_sample_size, distribute_labels,
-                                   shuffle_labels, in_batch_sampling, grid_sampler,
-                                   world_size, rank, return_label_multihots)
+        return _collate_atom_level(
+            batch,
+            label_sample_size,
+            distribute_labels,
+            shuffle_labels,
+            in_batch_sampling,
+            grid_sampler,
+            world_size,
+            rank,
+            return_label_multihots,
+        )
 
 
 def _collate_legacy(
@@ -72,9 +81,7 @@ def _collate_legacy(
             sampled_label_indices = torch.arange(start_idx, end_idx)[: label_sample_size // world_size]
         else:
             sampled_label_indices = (
-                torch.randperm(num_labels)[:label_sample_size]
-                if shuffle_labels
-                else torch.arange(min(label_sample_size, num_labels))
+                torch.randperm(num_labels)[:label_sample_size] if shuffle_labels else torch.arange(min(label_sample_size, num_labels))
             )
         label_embeddings = label_embeddings[sampled_label_indices]
         label_multihots = label_multihots[:, sampled_label_indices]
@@ -106,7 +113,7 @@ def _collate_atom_level(
     return_label_multihots=True,
 ):
     """
-    Collate for atom-level format (toxinnote): batches atom-level graphs.
+    Collate for atom-level format: batches atom-level graphs.
 
     Returns dict with:
         - graph_data: dict for encoder (esmc_embeddings, atom_coords, atom_types,
@@ -200,9 +207,7 @@ def _collate_atom_level(
             sampled_label_indices = torch.arange(start_idx, end_idx)[: label_sample_size // world_size]
         else:
             sampled_label_indices = (
-                torch.randperm(num_labels)[:label_sample_size]
-                if shuffle_labels
-                else torch.arange(min(label_sample_size, num_labels))
+                torch.randperm(num_labels)[:label_sample_size] if shuffle_labels else torch.arange(min(label_sample_size, num_labels))
             )
     elif in_batch_sampling:
         sampled_label_indices = torch.where(label_multihots.sum(dim=0) > 0)[0]
@@ -276,15 +281,11 @@ def collate_variable_sequence_length(
     processed_label_embeddings = None
 
     if grid_sampler:
-        assert (
-            label_sample_size is not None
-        ), "Must provide label_sample_size if using grid sampler"
+        assert label_sample_size is not None, "Must provide label_sample_size if using grid sampler"
         assert not in_batch_sampling, "Can't use in batch sampling with grid sampler"
 
     else:
-        assert not (
-            in_batch_sampling and (label_sample_size is not None)
-        ), "Cant use both in_batch_sampling with lable_sample_size"
+        assert not (in_batch_sampling and (label_sample_size is not None)), "Cant use both in_batch_sampling with lable_sample_size"
 
     sampled_label_indices = None
     num_labels = batch[0]["label_multihots"].shape[0]
@@ -296,9 +297,7 @@ def collate_variable_sequence_length(
             if not distribute_labels:
                 # If not distributing labels, sample from entire dataset
                 sampled_label_indices = (
-                    torch.randperm(num_labels)[:label_sample_size]
-                    if shuffle_labels
-                    else torch.arange(label_sample_size)
+                    torch.randperm(num_labels)[:label_sample_size] if shuffle_labels else torch.arange(label_sample_size)
                 )
             else:
                 # Otherwise, sample from the labels on this GPU
@@ -306,18 +305,12 @@ def collate_variable_sequence_length(
                 start_idx = rank * labels_per_partition
                 end_idx = start_idx + labels_per_partition
                 partition_indices = torch.arange(start_idx, end_idx)
-                sampled_label_indices = partition_indices[
-                    torch.randperm(len(partition_indices))[
-                        : label_sample_size // world_size
-                    ]
-                ]
+                sampled_label_indices = partition_indices[torch.randperm(len(partition_indices))[: label_sample_size // world_size]]
                 # if rank < 2:
                 #     print("GPU {}. Sampling range: {} to {}. Sampled {} labels".format(rank, start_idx, end_idx, sampled_label_indices[:10]))
 
     elif in_batch_sampling:
-        sampled_label_indices = torch.where(
-            sum(i["label_multihots"] for i in batch) > 0
-        )[0]
+        sampled_label_indices = torch.where(sum(i["label_multihots"] for i in batch) > 0)[0]
 
     # Apply the sampled labels to the label embeddings
     # We only use the first sequence in the batch to get the label embeddings to minimize complexity
@@ -348,11 +341,7 @@ def collate_variable_sequence_length(
         sequence_dim = sequence_onehots.shape[0]
 
         # Pad the sequence to the max_length and append to the processed_sequences list
-        processed_sequence_onehots.append(
-            torch.cat(
-                (sequence_onehots, torch.zeros((sequence_dim, padding_length))), dim=1
-            )
-        )
+        processed_sequence_onehots.append(torch.cat((sequence_onehots, torch.zeros((sequence_dim, padding_length))), dim=1))
 
         # Use the sampled labels for each element in the batch.
         if sampled_label_indices is not None:

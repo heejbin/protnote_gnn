@@ -3,15 +3,17 @@ Structural dataset: same GO/label format as ProteinDataset but returns graph + P
 
 Supports two data formats:
 - Legacy: Precomputed graph+PLM pkl: dict[sequence_id] -> (x, plm, edge_index, edge_s)
-- Atom-level (toxinnote): Graph archive (.pngrph) with ESM-C embeddings
+- Atom-level: Graph archive (.pngrph) with ESM-C embeddings
 """
-import os
+
 import json
-import pickle
 import logging
+import os
+import pickle
 from collections import defaultdict
-import pandas as pd
+
 import numpy as np
+import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
@@ -22,9 +24,9 @@ except ImportError:
     Data = None
     DataLoader = None
 
-from protnote.utils.data import read_fasta, get_vocab_mappings
-from protnote.utils.data import generate_vocabularies
 import blosum as bl
+
+from protnote.utils.data import generate_vocabularies, get_vocab_mappings, read_fasta
 
 # Amino acid to index mapping for vanilla mode
 AA_TO_INDEX = {aa: i + 1 for i, aa in enumerate("ACDEFGHIKLMNPQRSTVWY")}  # 1-indexed, 0=unknown
@@ -134,7 +136,6 @@ class ProteinStructureDataset(Dataset):
         self._finish_init(data_paths, config)
 
     def _finish_init(self, data_paths, config):
-
         # Load FASTA and filter to valid sequence_ids
         raw_data = read_fasta(data_paths["data_path"])
         self.data = [(seq, sid, labels) for (seq, sid, labels) in raw_data if sid in self.valid_ids]
@@ -148,11 +149,7 @@ class ProteinStructureDataset(Dataset):
             self.data = self.data[: int(subset_fraction * len(self.data))]
 
         extract_vocabularies_from = config["params"].get("EXTRACT_VOCABULARIES_FROM")
-        vocabulary_path = (
-            config["paths"][extract_vocabularies_from]
-            if extract_vocabularies_from
-            else self.data_path
-        )
+        vocabulary_path = config["paths"][extract_vocabularies_from] if extract_vocabularies_from else self.data_path
         self._preprocess_data(
             deduplicate=config["params"].get("DEDUPLICATE", True),
             max_sequence_length=config["params"].get("MAX_SEQUENCE_LENGTH"),
@@ -174,8 +171,9 @@ class ProteinStructureDataset(Dataset):
 
     def _get_archive_reader(self):
         """Lazily initialize the archive reader on first access."""
-        if self._archive_reader is None and hasattr(self, 'graph_archive_path') and self.graph_archive_path:
+        if self._archive_reader is None and hasattr(self, "graph_archive_path") and self.graph_archive_path:
             from protnote.utils.graph_archive import GraphArchiveReader
+
             self._archive_reader = GraphArchiveReader(self.graph_archive_path)
         return self._archive_reader
 
@@ -225,6 +223,7 @@ class ProteinStructureDataset(Dataset):
         self.data = list(df.itertuples(index=False, name=None))
 
         from collections import Counter
+
         label_freq = Counter()
         for _, _, labels in self.data:
             for lab in labels:
@@ -251,26 +250,17 @@ class ProteinStructureDataset(Dataset):
 
     def _process_label_embedding_mapping(self, mapping, embeddings):
         import pandas as pd
+
         if not isinstance(mapping, pd.DataFrame):
             mapping = pd.DataFrame(mapping)
-        descriptions_considered = (
-            self.label_augmentation_descriptions
-            if self.dataset_type == "train"
-            else self.inference_go_descriptions
-        )
-        mask = (mapping["description_type"].isin(descriptions_considered)) & (
-            mapping["id"].isin(self.label_vocabulary)
-        )
+        descriptions_considered = self.label_augmentation_descriptions if self.dataset_type == "train" else self.inference_go_descriptions
+        mask = (mapping["description_type"].isin(descriptions_considered)) & (mapping["id"].isin(self.label_vocabulary))
         if hasattr(mask, "values"):
             mask = mask.values
         mapping = mapping.loc[mask].reset_index(drop=True).reset_index()
         embeddings = embeddings[mask]
         token_counts = mapping["token_count"].values
-        mapping = (
-            mapping.groupby("id")
-            .agg(min_idx=("index", "min"), max_idx=("index", "max"))
-            .to_dict(orient="index")
-        )
+        mapping = mapping.groupby("id").agg(min_idx=("index", "min"), max_idx=("index", "max")).to_dict(orient="index")
         return mapping, embeddings, token_counts, None
 
     def _sort_label_embeddings(self):
@@ -293,10 +283,11 @@ class ProteinStructureDataset(Dataset):
     def calculate_label_weights(self, inv_freq=True, normalize=True, return_list=True, power=0.5):
         """Same interface as ProteinDataset.calculate_label_weights for weighted sampling/loss."""
         import numpy as np
+
         counts = np.array([self.label_frequency.get(lab, 0) for lab in self.label_vocabulary], dtype=np.float64)
         counts = np.clip(counts, 1e-6, None)
         if inv_freq:
-            weights = 1.0 / (counts ** power)
+            weights = 1.0 / (counts**power)
         else:
             weights = counts
         if normalize:
@@ -400,11 +391,13 @@ def create_structural_loaders(
     sequence_weights=None,
 ):
     """Create DataLoaders for structural encoder; uses collate_structure_batch."""
-    from functools import partial
     from collections import defaultdict
+    from functools import partial
+
     from torch.utils.data import DataLoader
-    from protnote.data.samplers import observation_sampler_factory
+
     from protnote.data.collators import collate_structure_batch
+    from protnote.data.samplers import observation_sampler_factory
 
     loaders = defaultdict(list)
     for dataset_type, dataset_list in datasets.items():

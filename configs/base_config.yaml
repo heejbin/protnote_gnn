@@ -66,10 +66,18 @@ params:
   RGDBCE_TEMP: 0.12 # search from [1,1/3,1/5,1/7,1/9] according to paper
   LABEL_SMOOTHING: 0.0 # Currently only implemented for FocalLoss
 
-  # Sequence and label encoders
-  USE_STRUCTURAL_ENCODER: TRUE  # True: EGNN structural encoder; False: ProteInfer sequence encoder
+  # Protein encoder settings
+  # Default: Hybrid ESM-C + EGNN encoder (use --use-sequence-encoder flag for legacy ProteInfer)
+  USE_PLM_EMBEDDINGS: True        # True: use ESM-C embeddings; False: use learned AA embeddings
+  LEARNED_AA_EMBEDDING_DIM: 128   # Dimension of learned AA embeddings (only used if USE_PLM_EMBEDDINGS=False)
+  EGNN_HIDDEN_DIM: 256            # EGNN hidden dimension
+  EGNN_OUT_DIM: 256               # EGNN output dimension (before projection)
+  EGNN_N_LAYERS: 4                # Number of EGNN layers
+  TRAIN_PROTEIN_ENCODER: True     # Whether to train the protein encoder
+
+  # Legacy ProteInfer encoder settings (only used with --use-sequence-encoder flag)
   PRETRAINED_SEQUENCE_ENCODER: True
-  TRAIN_SEQUENCE_ENCODER: True   # When USE_STRUCTURAL_ENCODER: True, train EGNN (StrucToxNet trains it from scratch). False = freeze structural encoder.
+  TRAIN_SEQUENCE_ENCODER: True    # Whether to train ProteInfer encoder
   LABEL_ENCODER_NUM_TRAINABLE_LAYERS: 0
   DISTRIBUTE_LABELS: False
   TRAIN_PROJECTION_HEAD: True
@@ -99,6 +107,12 @@ params:
   NUM_WORKERS: 3
   DECISION_TH: 0.5 # Set to null if you want to use the best threshold from validation
 
+  # ESM-C Embeddings (for atom-level mode with --use-atom-level flag)
+  ESMC_MODEL_NAME: esmc_300m
+  ESMC_EMBEDDING_DIM: 960
+  ESMC_MATCH_SIZE: 8
+  KNN_K: 20
+
   # Subset fractions (for rapid prototyping; set to 1 for final model)[s]
   TRAIN_SUBSET_FRACTION: 1 # Set to 1.0 if you want to use all data
   VALIDATION_SUBSET_FRACTION: 1 # Set to 1.0 if you want to use all data
@@ -117,7 +131,7 @@ embed_sequences_params:
   PROTEINFER_NUM_GO_LABELS: 32102
   PROTEINFER_NUM_EC_LABELS: 5134
 
-# Structural encoder (EGNN) params when USE_STRUCTURAL_ENCODER: True
+# Structural encoder (EGNN) params - used by both hybrid encoder and legacy structural encoder
 structural_encoder_params:
   # Node features: ProtT5 (StrucToxNet default) or ESM-C (proposal: ESM-C for transfer learning)
   # PLM_EMBEDDING_DIM is auto-set from PLM_MODEL (ProtT5->1069, ESM-C->1280). Override here if needed.
@@ -131,6 +145,10 @@ structural_encoder_params:
   # Paths (relative to data/); used when loading precomputed graphs/PLM
   STRUCTURE_GRAPH_DIR: structure_graphs/
   PLM_CACHE_DIR: plm_cache/
+
+  # Atom-level mode params (used with --use-atom-level flag)
+  ESMC_EMBEDDING_DIM: 960   # ESM-C per-residue embedding dimension
+  ATOM_TYPE_DIM: 37         # One-hot encoding dimension for atom types
 
 # Paths to data, vocabularies, embeddings, and models
 paths:
@@ -167,33 +185,46 @@ paths:
     # Vocabulary paths
     VOCABULARIES_DIR: vocabularies/proteinfer
     GO_ANNOTATIONS_PATH: annotations/go_annotations_jul_2024.pkl
+    GO_ANNOTATIONS_2024_07_PATH: annotations/go_annotations_jul_2024.pkl
     GO_ANNOTATIONS_2019_UPDATED_PATH: annotations/go_annotations_2019_07_01_updated.pkl
+    GO_ANNOTATIONS_2025_10_PATH: annotations/go_annotations_2025_10_10.pkl
     EC_ANNOTATIONS_PATH: annotations/ec_annotations.pkl
 
     # Embeddings paths (if using frozen pre-trained models)
     GO_BASE_LABEL_EMBEDDING_PATH: embeddings/frozen_label_embeddings.pt # this is the base path which is modified by POOLING_METHOD
     GO_2024_BASE_LABEL_EMBEDDING_PATH: embeddings/2024_frozen_label_embeddings.pt
+    GO_2025_10_BASE_LABEL_EMBEDDING_PATH: embeddings/202510_frozen_label_embeddings.pt
     EC_BASE_LABEL_EMBEDDING_PATH: embeddings/ecv1_frozen_label_embeddings.pt # this is the base path which is modified by POOLING_METHOD
 
     # ProteInfer paths
-    PARENTHOOD_LIB_PATH: vocabularies/parenthood_jul_2024.json
+    PARENTHOOD_LIB_PATH: vocabularies/parenthood_2025_10.json
     PROTEINFER_GO_WEIGHTS_PATH: models/proteinfer/GO_model_weights13703706.pkl
     PROTEINFER_EC_WEIGHTS_PATH: models/proteinfer/EC_model_weights13703966.pkl
 
-    #SwissProt
+    # SwissProt
     LATEST_SWISSPROT_DATA_PATH: swissprot/uniprot_sprot_jul_2024.dat
+    2024_07_SWISSPROT_DATA_PATH: swissprot/uniprot_sprot_jul_2024.dat
+    2025_10_SWISSPROT_DATA_PATH: swissprot/uniprot_sprot_oct_2025.dat
 
-    # Structural pipeline (when USE_STRUCTURAL_ENCODER: True)
-    # Proposal: structures from AlphaFoldDB (https://alphafold.ebi.ac.uk/) or AlphaFold 3.
-    # AlphaFoldDB is online; you download structures to a local dir, then point PDB_DIR here.
+    # Legacy structural pipeline (only used with legacy residue-level EGNN, not hybrid encoder)
+    # These paths are for backward compatibility with the old PyG-based structural encoder
     STRUCTURE_SOURCE: local   # local = PDB files already in PDB_DIR; alphafolddb = download from AlphaFoldDB into PDB_DIR first
-    PDB_DIR: pdb/             # Local directory for PDB/mmCIF files. For AlphaFoldDB: run bin/fetch_alphafold_structures.py to download here (sequence_id = UniProt ID).
+    PDB_DIR: pdb/             # Local directory for PDB/mmCIF files.
     STRUCTURE_GRAPH_DIR: structure_graphs/
     PLM_CACHE_DIR: plm_cache/
     STRUCTURE_INDEX_PATH: structure_index.json  # sequence_id (UniProt ID) -> local pdb_path
     STRUCTURE_GRAPH_PKL: structure_graphs/combined_graph_plm.pkl  # sequence_id -> (x, plm, edge_index, edge_s)
-    # Site ground truth for interpretability (UniProt TSV with Entry, Site columns; Site has "SITE 29; SITE 30; ...")
+    # Site ground truth for interpretability
     INTERPRETABILITY_SITE_TSV_PATH: annotations/uniprotkb_keyword_KW_0800_site.tsv
+
+    # Atom-level structural pipeline (DEFAULT - used by hybrid ESM-C + EGNN encoder)
+    # Run bin/prepare_graph_data.py to generate the graph archive
+    STRUCTURE_DIR: structures/              # Directory containing CIF/PDB structure files
+    ESMC_EMBEDDING_DIR: embeddings/esmc/    # Directory containing ESM-C embeddings (.pt files)
+    ESMC_INDEX_PATH: embeddings/esmc/index.json  # sequence_id -> esmc_filename
+    PROCESSED_GRAPH_DIR: processed/         # Directory for processed atom-level graphs
+    GRAPH_INDEX_PATH: processed/graph_index.json  # sequence_id -> graph_filename
+    GRAPH_ARCHIVE_PATH: processed/graphs.pngrph   # Consolidated graph archive (optional)
 
   # Paths referenced relative to OUTPUT_PATH (will have "outputs" prepended)
   output_paths:
@@ -205,3 +236,18 @@ paths:
 
     # Where to log
     LOG_DIR: logs/
+
+# Remote data sources for downloading structures and data
+remote_data:
+  # Data & models published by original authors
+  ZENODO_ORIGINAL_DATA: https://zenodo.org/records/13897920/files/data.zip?download=1
+
+  # Modified data on HuggingFace
+  HUGGINGFACE_DATA_REPO: kagurazakahinagi/protnote_data
+
+  # RCSB PDB: https://www.rcsb.org/docs/programmatic-access/file-download-services
+  RCSB_PDB_URL: https://files.rcsb.org/download
+
+  # AlphaFold DB:
+  ALPHAFOLD_DB_API: https://alphafold.ebi.ac.uk/api/prediction
+  ALPHAFOLD_DB_URL: https://alphafold.ebi.ac.uk/files
