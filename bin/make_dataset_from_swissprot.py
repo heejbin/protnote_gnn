@@ -9,8 +9,10 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from tqdm import tqdm
 
-from protnote.utils.configs import construct_absolute_paths, get_logger, get_project_root, load_config
+from protnote.utils.configs import construct_absolute_paths, get_logger, get_project_root, register_resolvers
 from protnote.utils.data import COMMON_AMINOACIDS, generate_vocabularies, read_fasta, read_json
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 logger = get_logger()
 
@@ -75,8 +77,13 @@ def main(
     # Load the configuration and project root
 
     # Load the configuration and project root
-    config, project_root = load_config()
-    results_dir = config["paths"]["output_paths"]["RESULTS_DIR"]
+    project_root = get_project_root()
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+        cfg = compose(config_name="config")
+
+    results_dir = project_root / "outputs" / cfg.paths.output_paths.RESULTS_DIR
     swissprot_dir = project_root / "data" / "swissprot"
     annotations_dir = project_root / "data" / "annotations"
     latest_swissprot_file = swissprot_dir / latest_swissprot_file
@@ -187,9 +194,9 @@ def main(
     # Make a set of the GO labels from the label embeddings
     label_ids_2019 = set(pd.read_pickle(annotations_dir / "go_annotations_2019_07_01.pkl").index)
     annotations_latest = pd.read_pickle(annotations_dir / args.latest_go_annotations_file)
-    pinf_train = read_fasta(config["paths"]["data_paths"]["TRAIN_DATA_PATH"])
-    pinf_val = read_fasta(config["paths"]["data_paths"]["VAL_DATA_PATH"])
-    pinf_test = read_fasta(config["paths"]["data_paths"]["TEST_DATA_PATH"])
+    pinf_train = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TRAIN_DATA_PATH))
+    pinf_val = read_fasta(str(project_root / "data" / cfg.paths.data_paths.VAL_DATA_PATH))
+    pinf_test = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TEST_DATA_PATH))
 
     label_ids_2024 = set(annotations_latest.index)
 
@@ -234,7 +241,7 @@ def main(
         raise ValueError(f"{sequence_vocabulary} not recognized")
 
     if label_vocabulary == "proteinfer":
-        vocab = set(generate_vocabularies(str(config["paths"]["data_paths"]["FULL_DATA_PATH"]))["label_vocab"])
+        vocab = set(generate_vocabularies(str(project_root / "data" / cfg.paths.data_paths.FULL_DATA_PATH))["label_vocab"])
     elif label_vocabulary == "new":
         vocab = new_go_labels
     elif label_vocabulary == "all":

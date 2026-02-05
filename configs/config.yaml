@@ -1,0 +1,38 @@
+defaults:
+  - params: default
+  - encoder/proteinfer: default
+  - encoder/structural: default
+  - paths: default
+  - remote: default
+  - _self_
+
+# Runtime settings (previously argparse-only in main.py)
+run:
+  name: ProtNote
+  train_path_name: null
+  validation_path_name: null
+  test_paths_names: null
+  full_path_name: null
+  annotations_path_name: GO_ANNOTATIONS_PATH
+  base_label_embedding_name: GO_BASE_LABEL_EMBEDDING_PATH
+  wandb_project: null
+  from_checkpoint: false
+  amlt: false
+  mlflow: false
+  model_file: null
+  save_prediction_results: false
+  eval_only_represented_labels: false
+  save_val_test_metrics: false
+  save_val_test_metrics_file: val_test_metrics.json
+  save_embeddings: false
+  use_sequence_encoder: false
+  nodes: 1
+  gpus: 1
+  nr: 0
+
+hydra:
+  run:
+    dir: .
+  job:
+    chdir: false
+  output_subdir: null

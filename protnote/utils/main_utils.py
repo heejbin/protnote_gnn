@@ -6,48 +6,52 @@ import pandas as pd
 from functools import partial
 import warnings
 
+from omegaconf import DictConfig
 
-def validate_arguments(args, parser):
+
+def validate_arguments(cfg: DictConfig):
+    run = cfg.run
+
     # Ensure the full data path is provided, or we are using the zero shot model
-    if args.full_path_name is None and "zero" not in str(args.train_path_name).lower():
+    if run.full_path_name is None and "zero" not in str(run.train_path_name).lower():
         warnings.warn(
             "The full path name is not provided and the train path name does not contain the word 'zero'. Please ensure this is intentional."
         )
 
     # Raise error if train is provided without val
-    if args.train_path_name is not None:
-        if args.validation_path_name is None:
-            parser.error(
-                "If providing --train-path-name you must provide --val-path-name."
+    if run.train_path_name is not None:
+        if run.validation_path_name is None:
+            raise ValueError(
+                "If providing train_path_name you must provide validation_path_name."
             )
 
     # Raise error if no train path is provided and no model is loaded
-    if (args.train_path_name is None) and (args.model_file is None):
-        parser.error(
-            "You must provide --load-model if no --train-path-names is provided"
+    if (run.train_path_name is None) and (run.model_file is None):
+        raise ValueError(
+            "You must provide model_file if no train_path_name is provided"
         )
 
     # Raise error if none of the paths are provided
 
     if (
-        (args.test_paths_names is None)
-        & (args.train_path_name is None)
-        & (args.validation_path_name is None)
+        (run.test_paths_names is None)
+        & (run.train_path_name is None)
+        & (run.validation_path_name is None)
     ):
-        parser.error(
+        raise ValueError(
             "You must provide one of the following options:\n"
-            "--test-path-names --load-model\n"
-            "--val-path-names --load-model\n"
-            "--train-path-name and --validation-path-name (optional load model)\n"
-            "--train-path-name and --validation-path-name --test-path-names (optional load model)\n"
-            "All cases with including --full-path-name. Please provide the required option(s) and try again."
+            "run.test_paths_names + run.model_file\n"
+            "run.validation_path_name + run.model_file\n"
+            "run.train_path_name and run.validation_path_name (optional model_file)\n"
+            "run.train_path_name and run.validation_path_name + run.test_paths_names (optional model_file)\n"
+            "All cases with including run.full_path_name. Please provide the required option(s) and try again."
         )
 
-    if (args.save_prediction_results) & (
-        (args.test_paths_names is None) & (args.validation_path_name is None)
+    if (run.save_prediction_results) & (
+        (run.test_paths_names is None) & (run.validation_path_name is None)
     ):
-        parser.error(
-            "You must provide --test-path-names and/or --val-path-names to save the results of the validation and/or test sets."
+        raise ValueError(
+            "You must provide test_paths_names and/or validation_path_name to save the results of the validation and/or test sets."
         )
 
 

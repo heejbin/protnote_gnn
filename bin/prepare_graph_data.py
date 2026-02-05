@@ -25,7 +25,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from protnote.utils.configs import load_config
+from protnote.utils.configs import get_project_root, register_resolvers
 from protnote.utils.data import read_fasta
 from protnote.utils.graph_archive import consolidate_to_archive
 from protnote.utils.structure import extract_aa_residue_by_chain_ids
@@ -198,18 +198,26 @@ def main():
     )
     args = parser.parse_args()
 
-    CONFIG, ROOT_PATH = load_config()
-    DATA_PATH = ROOT_PATH / "data"
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
 
-    knn_k = args.knn_k or CONFIG["params"].get("KNN_K", 20)
+    project_root = get_project_root()
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+        cfg = compose(config_name="config")
 
-    # Load indices (paths already absolute from load_config)
-    structure_dir = Path(CONFIG["paths"]["data_paths"].get("STRUCTURE_DIR", DATA_PATH / "structures"))
+    DATA_PATH = project_root / "data"
+
+    knn_k = args.knn_k or cfg.params.get("KNN_K", 20)
+
+    # Load indices (cfg has relative paths, prepend DATA_PATH)
+    structure_dir = Path(DATA_PATH / cfg.paths.data_paths.get("STRUCTURE_DIR", "structures"))
     structure_index_path = Path(
-        CONFIG["paths"]["data_paths"].get("STRUCTURE_INDEX_PATH", DATA_PATH / "structures" / "structure_index.json")
+        DATA_PATH / cfg.paths.data_paths.get("STRUCTURE_INDEX_PATH", "structures/structure_index.json")
     )
-    esmc_dir = Path(CONFIG["paths"]["data_paths"].get("ESMC_EMBEDDING_DIR", DATA_PATH / "embeddings" / "esmc"))
-    esmc_index_path = Path(CONFIG["paths"]["data_paths"].get("ESMC_INDEX_PATH", DATA_PATH / "embeddings" / "esmc" / "esmc_index.json"))
+    esmc_dir = Path(DATA_PATH / cfg.paths.data_paths.get("ESMC_EMBEDDING_DIR", "embeddings/esmc"))
+    esmc_index_path = Path(DATA_PATH / cfg.paths.data_paths.get("ESMC_INDEX_PATH", "embeddings/esmc/esmc_index.json"))
 
     if not structure_index_path.exists():
         logger.error(f"Structure index not found: {structure_index_path}. Run download_structures.py first.")
@@ -234,18 +242,18 @@ def main():
         logger.error("No proteins with both structure and ESM-C data.")
         return
 
-    # Load FASTA sequences for alignment (paths already absolute from load_config)
+    # Load FASTA sequences for alignment (cfg has relative paths, prepend DATA_PATH)
     fasta_paths = []
     for name in args.fasta_path_names:
-        path = CONFIG["paths"]["data_paths"].get(name)
-        if path:
-            fasta_paths.append(path)
+        rel_path = cfg.paths.data_paths.get(name)
+        if rel_path:
+            fasta_paths.append(Path(DATA_PATH / rel_path))
     sequence_map = collect_sequences_map(fasta_paths)
 
-    # Setup output (paths already absolute from load_config)
-    output_dir = Path(CONFIG["paths"]["data_paths"].get("PROCESSED_GRAPH_DIR", DATA_PATH / "processed"))
+    # Setup output (cfg has relative paths, prepend DATA_PATH)
+    output_dir = Path(DATA_PATH / cfg.paths.data_paths.get("PROCESSED_GRAPH_DIR", "processed"))
     output_dir.mkdir(parents=True, exist_ok=True)
-    graph_index_path = Path(CONFIG["paths"]["data_paths"].get("GRAPH_INDEX_PATH", DATA_PATH / "processed" / "graph_index.json"))
+    graph_index_path = Path(DATA_PATH / cfg.paths.data_paths.get("GRAPH_INDEX_PATH", "processed/graph_index.json"))
 
     # Load existing index
     if graph_index_path.exists():

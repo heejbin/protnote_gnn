@@ -4,7 +4,9 @@ from argparse import ArgumentParser
 from tqdm import tqdm
 from protnote.utils.data import read_fasta, save_to_fasta, generate_vocabularies
 from datetime import datetime
-from protnote.utils.configs import load_config
+from protnote.utils.configs import get_project_root, register_resolvers
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 
 def split_labels(label_vocabulary):
@@ -63,7 +65,11 @@ def main():
     - output_path: str, directory where the filtered fasta files will be saved.
     """
 
-    config, project_root = load_config()
+    project_root = get_project_root()
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+        cfg = compose(config_name="config")
 
     parser = ArgumentParser(
         description="Filter and save datasets for zero-shot learning."
@@ -72,19 +78,19 @@ def main():
         "--train-path",
         required=False,
         help="Path to the training set fasta file.",
-        default=config["paths"]['data_paths']['TRAIN_DATA_PATH'],
+        default=str(project_root / "data" / cfg.paths.data_paths.TRAIN_DATA_PATH),
     )
     parser.add_argument(
         "--val-path",
         required=False,
         help="Path to the validation set fasta file.",
-        default=config["paths"]['data_paths']['VAL_DATA_PATH'],
+        default=str(project_root / "data" / cfg.paths.data_paths.VAL_DATA_PATH),
     )
     parser.add_argument(
         "--test-path",
         required=False,
         help="Path to the test set fasta file.",
-        default=config["paths"]['data_paths']['TEST_DATA_PATH'],
+        default=str(project_root / "data" / cfg.paths.data_paths.TEST_DATA_PATH),
     )
     args = parser.parse_args()
 
@@ -93,7 +99,7 @@ def main():
     val = read_fasta(args.val_path)
     test = read_fasta(args.test_path)
 
-    label_vocabulary = generate_vocabularies(file_path=str(config["paths"]['data_paths']['FULL_DATA_PATH']))["label_vocab"]
+    label_vocabulary = generate_vocabularies(file_path=str(project_root / "data" / cfg.paths.data_paths.FULL_DATA_PATH))["label_vocab"]
 
     train_labels, val_labels, test_labels = split_labels(label_vocabulary)
 

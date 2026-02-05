@@ -1,10 +1,11 @@
-import argparse
 import json
 import os
 
+import hydra
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModel, AutoTokenizer
 
@@ -37,172 +38,34 @@ from protnote.utils.models import (
 torch.cuda.empty_cache()
 
 
-def main():
-    # ---------------------- HANDLE ARGUMENTS ----------------------#
-    parser = argparse.ArgumentParser(description="Train and/or Test the ProtNote model.")
-    parser.add_argument(
-        "--train-path-name",
-        type=str,
-        default=None,
-        help="Specify the desired train path name to train the model using names from config file. If not provided, model will not be trained. If provided, must also provide --val-path.",
-    )
-
-    parser.add_argument(
-        "--validation-path-name",
-        type=str,
-        default=None,
-        help="Specify the desired val path name to validate the model during training using names from config file. If not provided, model will not be trained. If provided, must also provide --train-path.",
-    )
-
-    parser.add_argument(
-        "--full-path-name",
-        type=str,
-        default=None,
-        help="Specify the desired full path name to define the vocabularies. Defaults to the full path name in the config file.",
-    )
-
-    parser.add_argument(
-        "--test-paths-names",
-        nargs="+",
-        type=str,
-        default=None,
-        help="Specify all the desired test paths names to test the model using names from config file to test. If not provided, model will not be tested.",
-    )
-
-    parser.add_argument(
-        "--annotations-path-name",
-        type=str,
-        default="GO_ANNOTATIONS_PATH",
-        help="Name of the annotation path. Defaults to GO.",
-    )
-
-    parser.add_argument(
-        "--base-label-embedding-name",
-        type=str,
-        default="GO_BASE_LABEL_EMBEDDING_PATH",
-        help="Name of the base label embedding path. Defaults to GO.",
-    )
-
-    parser.add_argument(
-        "--use-wandb",
-        type=str,
-        default=None,
-        help="Weights & Biases project name for logging. Default is None.",
-    )
-
-    parser.add_argument(
-        "--from-checkpoint",
-        action="store_true",
-        default=False,
-        help="Continue training from a previous model checkpoint (including optimizer state and epoch). Default is False.",
-    )
-
-    parser.add_argument(
-        "--name",
-        type=str,
-        default="ProtNote",
-        help="Name of the W&B run. If not provided, a name will be generated.",
-    )
-
-    parser.add_argument(
-        "--amlt",
-        action="store_true",
-        default=False,
-        help="Run job on Amulet. Default is False.",
-    )
-
-    parser.add_argument(
-        "--mlflow",
-        action="store_true",
-        default=False,
-        help="Use MLFlow. Default is False.",
-    )
-    parser.add_argument("--override", nargs="*", help="Override config parameters in key-value pairs.")
-
-    parser.add_argument(
-        "--save-prediction-results",
-        action="store_true",
-        default=False,
-        help="Save predictions and ground truth dataframe for validation and/or test",
-    )
-
-    parser.add_argument(
-        "--eval-only-represented-labels",
-        action="store_true",
-        default=False,
-        help="Evaluate only the represented labels",
-    )
-
-    parser.add_argument(
-        "--save-val-test-metrics",
-        action="store_true",
-        default=False,
-        help="Append val/test metrics to json",
-    )
-
-    parser.add_argument(
-        "--save-embeddings",
-        action="store_true",
-        default=False,
-        help="Save different embeddings from the model FOR TEST SET ONLY",
-    )
-
-    parser.add_argument(
-        "-n",
-        "--nodes",
-        default=1,
-        type=int,
-        metavar="N",
-        help="Number of nodes (default: 1)",
-    )
-
-    parser.add_argument("-g", "--gpus", default=1, type=int, help="Number of gpus per node (default: 1)")
-
-    parser.add_argument("-nr", "--nr", default=0, type=int, help="Ranking within the nodes")
-
-    parser.add_argument(
-        "--model-file",
-        type=str,
-        default=None,
-        help=".pt weights to initialize protnote. If not provided, a new model will be initialized.",
-    )
-
-    parser.add_argument(
-        "--save-val-test-metrics-file", help="json file name to append val/test metrics", type=str, default="val_test_metrics.json"
-    )
-
-    parser.add_argument(
-        "--use-sequence-encoder",
-        action="store_true",
-        default=False,
-        help="Use legacy ProteInfer sequence encoder instead of hybrid ESM-C + EGNN encoder (default).",
-    )
-
-    args = parser.parse_args()
-    validate_arguments(args, parser)
+@hydra.main(version_base=None, config_path="../configs", config_name="config")
+def main(cfg: DictConfig):
+    run = cfg.run
+    validate_arguments(cfg)
 
     # TODO: If running with multiple GPUs, make sure the vocabularies and embeddings have been pre-generated (otherwise, it will be generated multiple times)
 
     # Distributed computing
-    args.world_size = args.gpus * args.nodes
-    if args.amlt:
-        # os.environ['MASTER_ADDR'] = os.environ['MASTER_IP']
-        args.nr = int(os.environ["NODE_RANK"])
+    run.world_size = run.gpus * run.nodes
+    if run.amlt:
+        run.nr = int(os.environ["NODE_RANK"])
     else:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "8889"
 
-    mp.spawn(train_validate_test, nprocs=args.gpus, args=(args,))
+    mp.spawn(train_validate_test, nprocs=run.gpus, args=(cfg,))
 
 
-def train_validate_test(gpu, args):
+def train_validate_test(gpu, cfg):
+    run = cfg.run
+
     # Calculate GPU rank (based on node rank and GPU rank within the node) and initialize process group
-    rank = args.nr * args.gpus + gpu
-    dist.init_process_group(backend="nccl", init_method="env://", world_size=args.world_size, rank=rank)
+    rank = run.nr * run.gpus + gpu
+    dist.init_process_group(backend="nccl", init_method="env://", world_size=run.world_size, rank=rank)
     print(
         f"{'=' * 50}\n"
-        f"Initializing GPU {gpu}/{args.gpus - 1} on node {args.nr};\n"
-        f"    or, gpu {rank + 1}/{args.world_size} for all nodes.\n"
+        f"Initializing GPU {gpu}/{run.gpus - 1} on node {run.nr};\n"
+        f"    or, gpu {rank + 1}/{run.world_size} for all nodes.\n"
         f"{'=' * 50}"
     )
 
@@ -212,22 +75,11 @@ def train_validate_test(gpu, args):
     is_master = rank == 0
 
     # Unpack and process the config file
-    if args.model_file:
-        args.model_file = project_root / "data" / "models" / "ProtNote" / args.model_file
-    args.save_val_test_metrics_file = project_root / "outputs" / "results" / args.save_val_test_metrics_file
-    task = args.annotations_path_name.split("_")[0]
-    config = get_setup(
-        config_path=project_root / "configs" / "base_config.yaml",
-        run_name=args.name,
-        overrides=args.override,
-        train_path_name=args.train_path_name,
-        val_path_name=args.validation_path_name,
-        test_paths_names=args.test_paths_names,
-        annotations_path_name=args.annotations_path_name,
-        base_label_embedding_name=args.base_label_embedding_name,
-        amlt=args.amlt,
-        is_master=is_master,
-    )
+    if run.model_file:
+        run.model_file = str(project_root / "data" / "models" / "ProtNote" / run.model_file)
+    run.save_val_test_metrics_file = str(project_root / "outputs" / "results" / run.save_val_test_metrics_file)
+    task = run.annotations_path_name.split("_")[0]
+    config = get_setup(cfg, is_master=is_master)
     params, paths, timestamp, logger = (
         config["params"],
         config["paths"],
@@ -244,16 +96,18 @@ def train_validate_test(gpu, args):
     seed_everything(params["SEED"], device)
 
     # Initialize W&B, if using
-    if is_master and args.use_wandb is not None:
+    if is_master and run.wandb_project is not None:
         wandb.init(
-            project=args.use_wandb,
-            name=f"{args.name}_{timestamp}",
-            config={**params, **vars(args)},
+            project=run.wandb_project,
+            name=f"{run.name}_{timestamp}",
+            config=OmegaConf.to_container(params, resolve=True) | dict(
+                name=run.name, amlt=run.amlt, model_file=run.model_file,
+            ),
             sync_tensorboard=False,
             entity="hinagi",
         )
 
-        if args.amlt & args.mlflow:
+        if run.amlt & run.mlflow:
             import mlflow
 
             # MLFlow logging for Hyperdrive
@@ -264,7 +118,7 @@ def train_validate_test(gpu, args):
         logger.info(f"W&B link: {wandb.run.get_url()}")
 
     # Log the params
-    logger.info(json.dumps(params, indent=4))
+    logger.info(OmegaConf.to_yaml(params))
 
     # Initialize label tokenizer
     label_tokenizer = AutoTokenizer.from_pretrained(params["LABEL_ENCODER_CHECKPOINT"], force_download=True)
@@ -276,7 +130,7 @@ def train_validate_test(gpu, args):
 
     # ---------------------- DATASETS ----------------------#
     # Determine encoder mode: hybrid (default) or sequence (legacy ProteInfer)
-    use_hybrid = not args.use_sequence_encoder
+    use_hybrid = not run.use_sequence_encoder
 
     # Load graph index if using hybrid encoder
     graph_index = {}
@@ -329,11 +183,11 @@ def train_validate_test(gpu, args):
         return DatasetClass(**kwargs)
 
     # Create individual datasets
-    train_dataset = _make_dataset(config["dataset_paths"]["train"][0], params["GRID_SAMPLER"]) if args.train_path_name is not None else None
+    train_dataset = _make_dataset(config["dataset_paths"]["train"][0], params["GRID_SAMPLER"]) if run.train_path_name is not None else None
 
-    validation_dataset = _make_dataset(config["dataset_paths"]["validation"][0], False) if args.validation_path_name is not None else None
+    validation_dataset = _make_dataset(config["dataset_paths"]["validation"][0], False) if run.validation_path_name is not None else None
 
-    test_dataset = _make_dataset(config["dataset_paths"]["test"][0], False) if args.test_paths_names is not None else None
+    test_dataset = _make_dataset(config["dataset_paths"]["test"][0], False) if run.test_paths_names is not None else None
 
     # Add datasets to a dictionary
     # TODO: This does not support multiple datasets. But I think we should remove that support anyway. Too complicated.
@@ -360,7 +214,7 @@ def train_validate_test(gpu, args):
 
     # Calculate the weighting for the train dataset
     sequence_weights = None
-    if params["WEIGHTED_SAMPLING"] & (args.train_path_name is not None):
+    if params["WEIGHTED_SAMPLING"] & (run.train_path_name is not None):
         # Calculate label weights (need dict format for calculate_sequence_weights)
         logger.info("Calculating label weights for weighted sampling...")
         label_weights = datasets["train"][0].calculate_label_weights(
@@ -392,7 +246,7 @@ def train_validate_test(gpu, args):
             shuffle_labels=params["SHUFFLE_LABELS"],
             in_batch_sampling=params["IN_BATCH_SAMPLING"],
             num_workers=params["NUM_WORKERS"],
-            world_size=args.world_size,
+            world_size=run.world_size,
             rank=rank,
             sequence_weights=sequence_weights,
         )
@@ -405,7 +259,7 @@ def train_validate_test(gpu, args):
             in_batch_sampling=params["IN_BATCH_SAMPLING"],
             grid_sampler=params["GRID_SAMPLER"],
             num_workers=params["NUM_WORKERS"],
-            world_size=args.world_size,
+            world_size=run.world_size,
             rank=rank,
             sequence_weights=sequence_weights,
         )
@@ -426,7 +280,7 @@ def train_validate_test(gpu, args):
         logger.info(f"Using structural encoder: ESM-C + EGNN (output_dim={params['PROTEIN_EMBEDDING_DIM']})")
     else:
         # Legacy ProteInfer sequence encoder
-        if params["PRETRAINED_SEQUENCE_ENCODER"] & (args.model_file is None):
+        if params["PRETRAINED_SEQUENCE_ENCODER"] & (run.model_file is None):
             sequence_encoder = ProteInfer.from_pretrained(
                 weights_path=paths[f"PROTEINFER_{task}_WEIGHTS_PATH"],
                 num_labels=config["embed_sequences_params"]["PROTEINFER_NUM_GO_LABELS"],
@@ -493,7 +347,7 @@ def train_validate_test(gpu, args):
     model = DDP(model.to(rank), device_ids=[rank], find_unused_parameters=True)
 
     # Calculate bce_pos_weight based on the training set
-    if (params["BCE_POS_WEIGHT"] is None) & (args.train_path_name is not None):
+    if (params["BCE_POS_WEIGHT"] is None) & (run.train_path_name is not None):
         bce_pos_weight = datasets["train"][0].calculate_pos_weight().to(device)
     elif params["BCE_POS_WEIGHT"] is not None:
         bce_pos_weight = torch.tensor(params["BCE_POS_WEIGHT"]).to(device)
@@ -501,7 +355,7 @@ def train_validate_test(gpu, args):
         raise ValueError("BCE_POS_WEIGHT is not provided and no training set is provided to calculate it.")
 
     if params["LOSS_FN"] == "WeightedBCE":
-        if args.train_path_name is not None:
+        if run.train_path_name is not None:
             logger.info("calculating WEIGHTED BCE WEIGHTS")
             label_weights = (
                 datasets["train"][0]
@@ -517,7 +371,7 @@ def train_validate_test(gpu, args):
             raise ValueError("Must provde training set")
 
     elif params["LOSS_FN"] == "CBLoss":
-        if args.train_path_name is not None:
+        if run.train_path_name is not None:
             label_weights = (
                 datasets["train"][0]
                 .calculate_label_weights(
@@ -543,9 +397,9 @@ def train_validate_test(gpu, args):
         config=config,
         logger=logger,
         timestamp=timestamp,
-        run_name=args.name,
-        use_wandb=args.use_wandb is not None and is_master,
-        use_amlt=args.amlt,
+        run_name=run.name,
+        use_wandb=run.wandb_project is not None and is_master,
+        use_amlt=run.amlt,
         loss_fn=loss_fn,
         is_master=is_master,
     )
@@ -555,15 +409,15 @@ def train_validate_test(gpu, args):
 
     # Load the model weights if --load-model argument is provided (using the DATA_PATH directory as the root)
     # TODO: Process model loading in the get_setup function
-    if args.model_file:
+    if run.model_file:
         load_model(
             trainer=Trainer,
-            checkpoint_path=os.path.join(config["DATA_PATH"], args.model_file),
+            checkpoint_path=os.path.join(config["DATA_PATH"], run.model_file),
             rank=rank,
-            from_checkpoint=args.from_checkpoint,
+            from_checkpoint=run.from_checkpoint,
         )
         logger.info(
-            f"Loading model checkpoing from {os.path.join(config['DATA_PATH'], args.model_file)}. If training, will continue from epoch {Trainer.epoch + 1}.\n"
+            f"Loading model checkpoing from {os.path.join(config['DATA_PATH'], run.model_file)}. If training, will continue from epoch {Trainer.epoch + 1}.\n"
         )
 
     # Initialize EvalMetrics
@@ -577,7 +431,7 @@ def train_validate_test(gpu, args):
     [logger.info(f"{subset_name} dataset size: {len(dataset)}") for subset_name, subset in datasets.items() for dataset in subset]
 
     ####### TRAINING AND VALIDATION LOOPS #######
-    if args.train_path_name is not None:
+    if run.train_path_name is not None:
         # Train function
         Trainer.train(
             train_loader=loaders["train"][0],
@@ -593,7 +447,7 @@ def train_validate_test(gpu, args):
                 num_labels=label_sample_sizes["validation"],
             ),
             val_optimization_metric_name=params["OPTIMIZATION_METRIC_NAME"],
-            only_represented_labels=args.eval_only_represented_labels,
+            only_represented_labels=run.eval_only_represented_labels,
         )
     else:
         logger.info("Skipping training...")
@@ -603,14 +457,14 @@ def train_validate_test(gpu, args):
     all_metrics = {}
 
     # Setup for validation
-    run_metrics = {"name": args.name}
-    if args.save_val_test_metrics & is_master:
-        if not os.path.exists(args.save_val_test_metrics_file):
-            write_json([], args.save_val_test_metrics_file)
-        metrics_results = read_json(args.save_val_test_metrics_file)
+    run_metrics = {"name": run.name}
+    if run.save_val_test_metrics & is_master:
+        if not os.path.exists(run.save_val_test_metrics_file):
+            write_json([], run.save_val_test_metrics_file)
+        metrics_results = read_json(run.save_val_test_metrics_file)
 
     best_th = None
-    if args.validation_path_name:
+    if run.validation_path_name:
         # Reinitialize the validation loader with all the data, in case we were using a subset to expedite training
         logger.info(f"\n{'=' * 100}\nTesting on validation set\n{'=' * 100}")
 
@@ -635,17 +489,17 @@ def train_validate_test(gpu, args):
                 threshold=best_th if best_th is not None else params["DECISION_TH"],
                 num_labels=label_sample_sizes["validation"],
             ),
-            save_results=args.save_prediction_results,
+            save_results=run.save_prediction_results,
             data_loader_name="final_validation",
         )
         all_metrics.update(validation_metrics)
         logger.info(json.dumps(validation_metrics, indent=4))
-        if args.save_val_test_metrics:
+        if run.save_val_test_metrics:
             run_metrics.update(validation_metrics)
         logger.info("Final validation complete.")
 
     # Setup for testing
-    if args.test_paths_names:
+    if run.test_paths_names:
         for idx, test_loader in enumerate(loaders["test"]):
             logger.info(f"\n{'=' * 100}\nTesting on test set {idx + 1}/{len(loaders['test'])}\n{'=' * 100}")
             if is_master:
@@ -659,13 +513,13 @@ def train_validate_test(gpu, args):
                     threshold=best_th if best_th is not None else params["DECISION_TH"],
                     num_labels=label_sample_sizes["test"],
                 ),
-                save_results=args.save_prediction_results,
+                save_results=run.save_prediction_results,
                 data_loader_name=f"test_{idx + 1}",
-                return_embeddings=args.save_embeddings,
+                return_embeddings=run.save_embeddings,
             )
             all_test_metrics.update(test_metrics)
             logger.info(json.dumps(test_metrics, indent=4))
-            if args.save_val_test_metrics:
+            if run.save_val_test_metrics:
                 run_metrics.update(test_metrics)
             logger.info("Testing complete.")
 
@@ -677,27 +531,27 @@ def train_validate_test(gpu, args):
     # W&B, MLFlow amd optional metric results saving
     if is_master:
         # Optionally save val/test results in json
-        if args.save_val_test_metrics:
+        if run.save_val_test_metrics:
             metrics_results.append(run_metrics)
-            write_json(metrics_results, args.save_val_test_metrics_file)
+            write_json(metrics_results, run.save_val_test_metrics_file)
         # Log test metrics
-        if args.test_paths_names:
-            if args.use_wandb is not None:
+        if run.test_paths_names:
+            if run.wandb_project is not None:
                 wandb.log(all_test_metrics)
-            if args.amlt & args.mlflow:
+            if run.amlt & run.mlflow:
                 mlflow.log_metrics(all_test_metrics)
 
         # Log val metrics
-        if args.validation_path_name:
-            if args.use_wandb is not None:
+        if run.validation_path_name:
+            if run.wandb_project is not None:
                 wandb.log(validation_metrics)
-            if args.amlt & args.mlflow:
+            if run.amlt & run.mlflow:
                 mlflow.log_metrics(validation_metrics)
 
         # Close metric loggers
-        if args.use_wandb is not None:
+        if run.wandb_project is not None:
             wandb.finish()
-        if args.amlt & args.mlflow:
+        if run.amlt & run.mlflow:
             mlflow.end_run()
 
     # Loggers

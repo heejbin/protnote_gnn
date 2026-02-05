@@ -10,11 +10,17 @@ import torch
 import obonet
 import argparse
 from tqdm import tqdm
-from protnote.utils.configs import load_config
+from protnote.utils.configs import get_project_root, register_resolvers
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 # Load the configuration and project root
-config, project_root = load_config()
-results_dir = config["paths"]["output_paths"]["RESULTS_DIR"]
+project_root = get_project_root()
+register_resolvers()
+GlobalHydra.instance().clear()
+with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+    cfg = compose(config_name="config")
+results_dir = project_root / "outputs" / cfg.paths.output_paths.RESULTS_DIR
 
 def save_fig(name):
     plt.savefig(f"{name}.pdf", format="pdf", dpi=1200, bbox_inches="tight")
@@ -87,7 +93,7 @@ if __name__ == "__main__":
     embeddings = torch.load(args.embeddings_path,map_location="cpu")
     joint_embedding_dim = embeddings["joint_embeddings"].shape[-1]
     num_labels = embeddings["labels"].shape[-1]
-    vocab = generate_vocabularies(str(config['paths']['data_paths'][args.test_data_path]))["label_vocab"]
+    vocab = generate_vocabularies(str(project_root / "data" / cfg.paths.data_paths[args.test_data_path]))["label_vocab"]
     graph = obonet.read_obo(project_root / 'data' / 'annotations' / args.go_graph_file)
     vocab_parents = [
         (graph.nodes[go_term]["namespace"] if go_term in graph.nodes else "missing")
@@ -121,7 +127,7 @@ if __name__ == "__main__":
 
     print("running umap plots...")
     for n_neighbors, min_dist in tqdm(combos, total=num_combinations):
-        
+
         X_r = umap.UMAP(n_neighbors=n_neighbors, min_dist=min_dist).fit(X_s).embedding_
 
         fig = plt.figure(figsize=(7, 7))
@@ -151,7 +157,7 @@ if __name__ == "__main__":
 
         # Output layer colored by GO Top hierarchy
         fig = plt.figure(figsize=(7, 7))
-        
+
         palette_ = palette[4:5] + palette[8:10]
         match_binary_mask = match_binary_mask.astype(bool)
         X_r = (

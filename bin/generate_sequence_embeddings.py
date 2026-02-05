@@ -18,7 +18,7 @@ from pathlib import Path
 import torch
 from tqdm import tqdm
 
-from protnote.utils.configs import load_config
+from protnote.utils.configs import get_project_root, register_resolvers
 from protnote.utils.data import read_fasta
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -78,27 +78,35 @@ def main():
     )
     args = parser.parse_args()
 
-    CONFIG, ROOT_PATH = load_config()
-    DATA_PATH = ROOT_PATH / "data"
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
 
-    model_name = args.model_name or CONFIG["params"].get("ESMC_MODEL_NAME", "esmc_300m")
-    batch_size = args.batch_size or CONFIG["params"].get("ESMC_BATCH_SIZE", 8)
-    embedding_dim = CONFIG["params"].get("ESMC_EMBEDDING_DIM", 960)
+    project_root = get_project_root()
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+        cfg = compose(config_name="config")
 
-    # Resolve FASTA paths
+    DATA_PATH = project_root / "data"
+
+    model_name = args.model_name or cfg.params.get("ESMC_MODEL_NAME", "esmc_300m")
+    batch_size = args.batch_size or cfg.params.get("ESMC_BATCH_SIZE", 8)
+    embedding_dim = cfg.params.get("ESMC_EMBEDDING_DIM", 960)
+
+    # Resolve FASTA paths (cfg has relative paths, prepend DATA_PATH)
     fasta_paths = []
     for name in args.fasta_path_names:
-        path = CONFIG["paths"]["data_paths"].get(name)
-        if path:
-            fasta_paths.append(path)
+        rel_path = cfg.paths.data_paths.get(name)
+        if rel_path:
+            fasta_paths.append(Path(DATA_PATH / rel_path))
 
     # Collect sequences
     all_pairs = collect_sequences(fasta_paths)
 
-    # Setup output directory
-    emb_dir = Path(CONFIG["paths"]["data_paths"].get("ESMC_EMBEDDING_DIR", DATA_PATH / "embeddings" / "esmc"))
+    # Setup output directory (cfg has relative paths, prepend DATA_PATH)
+    emb_dir = Path(DATA_PATH / cfg.paths.data_paths.get("ESMC_EMBEDDING_DIR", "embeddings/esmc"))
     emb_dir.mkdir(parents=True, exist_ok=True)
-    index_path = Path(CONFIG["paths"]["data_paths"].get("ESMC_INDEX_PATH", DATA_PATH / "embeddings" / "esmc" / "esmc_index.json"))
+    index_path = Path(DATA_PATH / cfg.paths.data_paths.get("ESMC_INDEX_PATH", "embeddings/esmc/esmc_index.json"))
 
     # Load existing index
     if index_path.exists():

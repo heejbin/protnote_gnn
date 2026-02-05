@@ -3,10 +3,9 @@ import logging
 import os
 import sys
 import time
-from ast import literal_eval
 from pathlib import Path
 
-from protnote.utils.data import read_yaml
+from omegaconf import DictConfig, OmegaConf
 
 
 def get_logger():
@@ -34,36 +33,26 @@ def get_logger():
     return logger
 
 
-def try_literal_eval(val):
-    try:
-        # Attempt to evaluate as a literal
-        return literal_eval(val)
-    except (ValueError, SyntaxError):
-        # If evaluation fails means input is actually a string
-        if val == "null":
-            return None
-        if (val == "false") | (val == "true"):
-            return literal_eval(val.title())
-        return val
+def register_resolvers():
+    """Register custom OmegaConf resolvers. Safe to call multiple times."""
+    if not OmegaConf.has_resolver("project_root"):
+        OmegaConf.register_new_resolver("project_root", lambda: str(get_project_root()))
+    if not OmegaConf.has_resolver("data_root"):
+        OmegaConf.register_new_resolver("data_root", lambda: _get_data_root())
+    if not OmegaConf.has_resolver("output_root"):
+        OmegaConf.register_new_resolver("output_root", lambda: _get_output_root())
 
 
-def override_config(config: dict, overrides: list):
-    # Process the overrides if provided
-    if overrides:
-        if len(overrides) % 2 != 0:
-            raise ValueError("Overrides must be provided as key-value pairs.")
+def _get_data_root():
+    if os.environ.get("AMLT_DATA_DIR"):
+        return os.environ["AMLT_DATA_DIR"]
+    return os.path.join(str(get_project_root()), "data")
 
-        # Convert the list to a dictionary
-        overrides = {overrides[i]: overrides[i + 1] for i in range(0, len(overrides), 2)}
 
-        # Update the config with the overrides
-        for key, value in overrides.items():
-            # Convert value to appropriate type if necessary (e.g., float, int)
-            # Here, we're assuming that the provided keys exist in the 'params' section of the config
-            if key in config["params"]:
-                config["params"][key] = try_literal_eval(value)
-            else:
-                raise KeyError(f"Key '{key}' not found in the 'params' section of the config.")
+def _get_output_root():
+    if os.environ.get("AMLT_OUTPUT_DIR"):
+        return os.environ["AMLT_OUTPUT_DIR"]
+    return os.path.join(str(get_project_root()), "outputs")
 
 
 def generate_label_embedding_path(params: dict, base_label_embedding_path: str):
@@ -96,56 +85,22 @@ def generate_label_embedding_path(params: dict, base_label_embedding_path: str):
     return label_embedding_path
 
 
-def get_setup(
-    config_path: str,
-    run_name: str,
-    overrides: list,
-    train_path_name: str = None,
-    val_path_name: str = None,
-    test_paths_names: list = None,
-    annotations_path_name: str = None,
-    base_label_embedding_name: str = None,
-    amlt: bool = False,
-    is_master: bool = True,
-):
-    # Get the root path from the environment variable; default to current directory if ROOT_PATH is not set
-    if amlt:
-        ROOT_PATH = os.getcwd()  # Set ROOT_PATH to working directory
-        DATA_PATH = os.environ["AMLT_DATA_DIR"]
-        OUTPUT_PATH = os.environ["AMLT_OUTPUT_DIR"]
-    else:
-        ROOT_PATH = str(Path(os.path.dirname(__file__)).parents[1])
-        print(ROOT_PATH)
-        DATA_PATH = os.path.join(ROOT_PATH, "data")
-        OUTPUT_PATH = os.path.join(ROOT_PATH, "outputs")
-        if not os.path.exists(OUTPUT_PATH) and is_master:
-            os.makedirs(OUTPUT_PATH)
-
-    # Load the configuration file and override the parameters if provided
-    config = read_yaml(os.path.join(ROOT_PATH, config_path))
-    if overrides:
-        override_config(config, overrides)
-
-    # Extract the model parameters from the (possibly overidden) config file
-    params = config["params"]
-
-    # Extract the fixed ProteInfer params from the config file
-    embed_sequences_params = config["embed_sequences_params"]
-
-    # Extract the remote data paths
-    remote_data = config["remote_data"]
-
-    # Prepend the correct path roots
-    # Define root paths for each section
-    section_paths = {
-        "data_paths": DATA_PATH,
-        "output_paths": OUTPUT_PATH,
-    }
-    paths = {
-        key: os.path.join(section_paths[section], value)
-        for section, section_values in config["paths"].items()
+def resolve_paths(paths_cfg, data_root: str, output_root: str) -> dict:
+    """Flatten nested paths config and prepend roots."""
+    section_roots = {"data_paths": data_root, "output_paths": output_root}
+    return {
+        key: os.path.join(section_roots[section], value)
+        for section, section_values in OmegaConf.to_container(paths_cfg, resolve=True).items()
         for key, value in section_values.items()
     }
+
+
+def _build_dataset_paths(paths: dict, run) -> dict:
+    """Build dataset path dicts from resolved paths and run config."""
+    train_path_name = run.train_path_name
+    val_path_name = run.validation_path_name
+    test_paths_names = run.test_paths_names
+    annotations_path_name = run.annotations_path_name
 
     train_paths_list = (
         [
@@ -187,18 +142,19 @@ def get_setup(
         else []
     )
 
-    dataset_paths = {
+    return {
         "train": train_paths_list,
         "validation": val_paths_list,
         "test": test_paths_list,
     }
 
-    # Set the timezone for the entire Python environment
+
+def _setup_logging(paths: dict, run_name: str, is_master: bool):
+    """Set up timezone, timestamp, and logging handlers."""
     os.environ["TZ"] = "US/Pacific"
     time.tzset()
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S %Z").strip()
 
-    # Initialize logging
     log_dir = paths["LOG_DIR"]
     if not os.path.exists(log_dir) and is_master:
         try:
@@ -208,45 +164,79 @@ def get_setup(
             pass
     full_log_path = os.path.join(log_dir, f"{timestamp}_{run_name}.log")
 
-    # Initialize the logger for all processes
     logger = logging.getLogger()
 
-    # Only log to file and console if this is the main process
     if is_master:
-        # Set the logging level (default for other processes is WARNING)
         logger.setLevel(logging.INFO)
 
-        # Create a formatter
         formatter = logging.Formatter(
             fmt="%(asctime)s %(levelname)-4s %(message)s",
             datefmt="%Y-%m-%d %H:%M:%S %Z",
         )
 
-        # Create a file handler and add it to the logger
         file_handler = logging.FileHandler(full_log_path, mode="w")
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
 
-        # Create a stream handler (for stdout) and add it to the logger
         stream_handler = logging.StreamHandler(sys.stdout)
         stream_handler.setFormatter(formatter)
         logger.addHandler(stream_handler)
 
         logger.info(f"Logging to {full_log_path} and console...")
     else:
-        # Set the logger level to an unreachable level, effectively disabling it
         logger.setLevel(logging.CRITICAL + 1)
 
-    # Generate embeddings
-    label_embedding_path = generate_label_embedding_path(params=params, base_label_embedding_path=paths[base_label_embedding_name])
+    return timestamp, logger
 
-    # Return a dictionary
+
+def get_setup(
+    cfg: DictConfig,
+    is_master: bool = True,
+) -> dict:
+    """Post-process a Hydra-loaded config: resolve paths, set up logging,
+    build dataset path dicts. Called after @hydra.main or compose()."""
+
+    register_resolvers()
+    run = cfg.run
+
+    amlt = run.amlt
+
+    # 1. Determine root paths (same AMLT logic)
+    if amlt:
+        ROOT_PATH = os.getcwd()
+        DATA_PATH = os.environ["AMLT_DATA_DIR"]
+        OUTPUT_PATH = os.environ["AMLT_OUTPUT_DIR"]
+    else:
+        ROOT_PATH = str(get_project_root())
+        print(ROOT_PATH)
+        DATA_PATH = os.path.join(ROOT_PATH, "data")
+        OUTPUT_PATH = os.path.join(ROOT_PATH, "outputs")
+        if not os.path.exists(OUTPUT_PATH) and is_master:
+            os.makedirs(OUTPUT_PATH)
+
+    # 2. Flatten and resolve paths
+    paths = resolve_paths(cfg.paths, DATA_PATH, OUTPUT_PATH)
+
+    # 3. Build dataset_paths
+    dataset_paths = _build_dataset_paths(paths, run)
+
+    # 4. Logging setup
+    timestamp, logger = _setup_logging(paths, run.name, is_master)
+
+    # 5. Generate label embedding path
+    params_dict = OmegaConf.to_container(cfg.params, resolve=True)
+    label_embedding_path = generate_label_embedding_path(
+        params=params_dict,
+        base_label_embedding_path=paths[run.base_label_embedding_name],
+    )
+
+    # 6. Return same dict shape as before
     return {
-        "params": params,
-        "embed_sequences_params": embed_sequences_params,
+        "params": cfg.params,
+        "embed_sequences_params": cfg.encoder.proteinfer,
         "paths": paths,
         "dataset_paths": dataset_paths,
-        "remote_data": remote_data,
+        "remote_data": cfg.remote,
         "timestamp": timestamp,
         "logger": logger,
         "ROOT_PATH": ROOT_PATH,
@@ -259,28 +249,6 @@ def get_setup(
 def get_project_root():
     """Dynamically determine the project root."""
     return Path(__file__).resolve().parent.parent.parent  # Adjust based on the folder structure
-
-
-def update_config_paths(config, project_root):
-    # Prepend project_root / 'data' to all paths in the 'data' section
-    for key, value in config["paths"].get("data_paths", {}).items():
-        config["paths"]["data_paths"][key] = project_root / "data" / value
-
-    for key, value in config["paths"].get("output_paths", {}).items():
-        config["paths"]["output_paths"][key] = project_root / "outputs" / value
-
-    return config
-
-
-def load_config(config_file: str = "base_config.yaml"):
-    """Load the environment variables and YAML configuration file."""
-    project_root = get_project_root()
-
-    # Load the YAML configuration file from the project root
-    config_file = project_root / "configs" / config_file
-    config = update_config_paths(read_yaml(config_file), project_root)
-
-    return config, project_root
 
 
 def construct_absolute_paths(dir: str, files: list) -> list:

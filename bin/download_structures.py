@@ -19,14 +19,22 @@ import pandas as pd
 import requests
 from tqdm import tqdm
 
-from protnote.utils.configs import load_config
+from protnote.utils.configs import get_project_root, register_resolvers
 from protnote.utils.network import fetch_with_retries
+
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-CONFIG, ROOT_PATH = load_config()
-DATA_PATH = ROOT_PATH / "data"
+project_root = get_project_root()
+register_resolvers()
+GlobalHydra.instance().clear()
+with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+    cfg = compose(config_name="config")
+
+DATA_PATH = project_root / "data"
 
 
 def parse_alphafold_db_api(accession_id: str) -> tuple[str, ...] | None:
@@ -38,7 +46,7 @@ def parse_alphafold_db_api(accession_id: str) -> tuple[str, ...] | None:
     Returns:
         tuple[str, ...] | None: A tuple containing the model entity ID, avg pLDDT, and CIF URL, or None if an error occurred.
     """
-    url = f"{CONFIG['remote_data']['ALPHAFOLD_DB_API']}/{accession_id}"
+    url = f"{cfg.remote.ALPHAFOLD_DB_API}/{accession_id}"
     try:
         response = fetch_with_retries(url)
     except requests.exceptions.RequestException as e:
@@ -67,8 +75,8 @@ def download_pdb_structure(seq_id: str, pdb_id: str, output_dir: Path, override:
     if output_path.exists() and not override:
         return output_path
 
-    url = f"{CONFIG['remote_data']['RCSB_PDB_URL']}/{pdb_id.upper()}.cif"
-    fallback_url = f"{CONFIG['remote_data']['RCSB_PDB_URL']}/{pdb_id.upper()}.pdb"
+    url = f"{cfg.remote.RCSB_PDB_URL}/{pdb_id.upper()}.cif"
+    fallback_url = f"{cfg.remote.RCSB_PDB_URL}/{pdb_id.upper()}.pdb"
 
     try:
         response = fetch_with_retries(url)
@@ -145,15 +153,15 @@ def main():
 
     args = parser.parse_args()
 
-    # Setup output directories
-    structure_dir = CONFIG["paths"]["data_paths"].get("STRUCTURE_DIR", DATA_PATH / "structures")
+    # Setup output directories (cfg has relative paths, prepend DATA_PATH)
+    structure_dir = Path(DATA_PATH / cfg.paths.data_paths.get("STRUCTURE_DIR", "structures"))
     pdb_dir = Path(structure_dir) / "pdb"
     af_dir = Path(structure_dir) / "alphafolddb"
     pdb_dir.mkdir(parents=True, exist_ok=True)
     af_dir.mkdir(parents=True, exist_ok=True)
 
     # Load existing index if available
-    index_path = CONFIG["paths"]["data_paths"].get("STRUCTURE_INDEX_PATH", DATA_PATH / "structures" / "structure_index.json")
+    index_path = Path(DATA_PATH / cfg.paths.data_paths.get("STRUCTURE_INDEX_PATH", "structures/structure_index.json"))
     if index_path.exists():
         with open(index_path) as f:
             structure_index = json.load(f)

@@ -7,12 +7,18 @@ from pathlib import Path
 
 import requests
 from huggingface_hub import HfApi, login, snapshot_download
-from tqdm import tqdm
 
-from protnote.utils.configs import load_config
+from protnote.utils.configs import get_project_root, register_resolvers
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
-config, project_root = load_config()
-datapath_remote = config["remote_data"]
+project_root = get_project_root()
+register_resolvers()
+GlobalHydra.instance().clear()
+with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+    cfg = compose(config_name="config")
+
+datapath_remote = cfg.remote
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +27,8 @@ logger = logging.getLogger(__name__)
 def _fetch_data_published() -> None:
     """Fetch ProtNote's published data & model from Zenodo."""
     # Download original data from Zenodo
+    from tqdm import tqdm
+
     response = requests.get(datapath_remote["ZENODO_ORIGINAL_DATA"], stream=True)
     response.raise_for_status()
     total_size_in_bytes = int(response.headers.get("content-length", 0))

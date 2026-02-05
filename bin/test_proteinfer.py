@@ -1,5 +1,5 @@
 from protnote.data.datasets import ProteinDataset, create_multiple_loaders
-from protnote.utils.configs import get_setup
+from protnote.utils.configs import get_setup, get_project_root, register_resolvers
 from protnote.models.protein_encoders import ProteInfer
 from protnote.utils.evaluation import EvalMetrics, save_evaluation_results
 from protnote.utils.data import read_json
@@ -14,7 +14,11 @@ from protnote.utils.losses import FocalLoss
 from torcheval.metrics import MultilabelAUPRC, BinaryAUPRC
 from torch.cuda.amp import autocast
 from protnote.utils.data import generate_vocabularies
-from protnote.utils.configs import get_project_root
+
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import OmegaConf
+
 # Load the configuration and project root
 project_root = get_project_root()
 
@@ -120,27 +124,37 @@ def to_device(device, *args):
     ]
 
 
+# Build Hydra overrides from argparse --override pairs
+hydra_overrides = [
+    "params.WEIGHTED_SAMPLING=false",
+    "params.TEST_BATCH_SIZE=4",
+]
 if args.override:
-    args.override += ["WEIGHTED_SAMPLING", "False", "TEST_BATCH_SIZE", 4]
-else:
-    args.override = ["WEIGHTED_SAMPLING", "False", "TEST_BATCH_SIZE", 4]
+    # Convert key-value pairs to Hydra override format
+    for i in range(0, len(args.override), 2):
+        key = args.override[i]
+        value = args.override[i + 1] if i + 1 < len(args.override) else ""
+        hydra_overrides.append(f"params.{key}={value}")
 
+if args.only_represented_labels:
+    hydra_overrides.append("params.EXTRACT_VOCABULARIES_FROM=null")
+
+# Load config via Hydra Compose API
+register_resolvers()
+GlobalHydra.instance().clear()
+with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+    cfg = compose(config_name="config", overrides=hydra_overrides)
+
+# Apply run settings from argparse
+cfg.run.name = args.name
+cfg.run.train_path_name = args.train_path_name
+cfg.run.validation_path_name = args.validation_path_name
+cfg.run.test_paths_names = args.test_paths_names
+cfg.run.annotations_path_name = args.annotations_path_name
+cfg.run.base_label_embedding_name = args.base_label_embedding_name
 
 task = args.annotations_path_name.split("_")[0]
-config = get_setup(
-    config_path=project_root / 'configs' / 'base_config.yaml',
-    run_name=args.name,
-    train_path_name=args.train_path_name,
-    val_path_name=args.validation_path_name,
-    test_paths_names=args.test_paths_names,
-    annotations_path_name=args.annotations_path_name,
-    base_label_embedding_name=args.base_label_embedding_name,
-    amlt=False,
-    is_master=True,
-    overrides=args.override + ["EXTRACT_VOCABULARIES_FROM", "null"]
-    if args.only_represented_labels
-    else args.override,
-)
+config = get_setup(cfg, is_master=True)
 params, paths, timestamp, logger = (
     config["params"],
     config["paths"],
@@ -216,7 +230,7 @@ loaders = create_multiple_loaders(
 model_weights = paths[f"PROTEINFER_{args.proteinfer_weights}_WEIGHTS_PATH"]
 if args.model_weights_id is not None:
     model_weights = re.sub(r'(\d+)\.pkl$', str(args.model_weights_id) + '.pkl', model_weights)
-    
+
 
 model = ProteInfer.from_pretrained(
     weights_path=model_weights,

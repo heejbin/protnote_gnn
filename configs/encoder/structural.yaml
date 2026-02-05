@@ -1,0 +1,17 @@
+# Structural encoder (EGNN) params - used by both hybrid encoder and legacy structural encoder
+# Node features: ProtT5 (StrucToxNet default) or ESM-C (proposal: ESM-C for transfer learning)
+# PLM_EMBEDDING_DIM is auto-set from PLM_MODEL (ProtT5->1069, ESM-C->1280). Override here if needed.
+PLM_MODEL: ProtT5   # ProtT5 | ESM-C  (ESM-C = ESM-2 based, e.g. esm2_t33_650M_UR50D)
+PLM_EMBEDDING_DIM: null   # null = auto from PLM_MODEL; or set 1069 / 1280 to override
+PROTEIN_EMBEDDING_DIM: 1100  # Must match PROTEIN_EMBEDDING_DIM for ProtNote W_p
+HIDDEN_NF: 256
+NUM_LAYERS: 3
+IN_EDGE_NF: 16
+DROPOUT: 0.5
+# Paths (relative to data/); used when loading precomputed graphs/PLM
+STRUCTURE_GRAPH_DIR: structure_graphs/
+PLM_CACHE_DIR: plm_cache/
+
+# Atom-level mode params (used with --use-atom-level flag)
+ESMC_EMBEDDING_DIM: 960   # ESM-C per-residue embedding dimension
+ATOM_TYPE_DIM: 37         # One-hot encoding dimension for atom types

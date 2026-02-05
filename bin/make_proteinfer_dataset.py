@@ -6,7 +6,9 @@ from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
 from Bio import SeqIO
 from tqdm import tqdm
-from protnote.utils.configs import get_project_root, load_config
+from protnote.utils.configs import get_project_root, register_resolvers
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 def process_sequence_tfrecord(record: dict, annotation_types: list):
     sequence = record["sequence"][0].decode()
@@ -75,8 +77,12 @@ if __name__ == "__main__":
     )
     parser = argparse.ArgumentParser()
 
-    config, project_root = load_config()
-    
+    project_root = get_project_root()
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+        cfg = compose(config_name="config")
+
     # TODO: I/O paths could be not required and default to some env var
     parser.add_argument(
         "--dataset-type",
@@ -90,7 +96,7 @@ if __name__ == "__main__":
         nargs="+",
         required=True
     )
-    
+
     args = parser.parse_args()
     input_dir = project_root / "data" / "swissprot" / "proteinfer_splits" / f"{args.dataset_type}"
 
