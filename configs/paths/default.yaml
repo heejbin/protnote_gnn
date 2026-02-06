@@ -1,0 +1,86 @@
+# Paths referenced relative to DATA_PATH (will have "data" prepended)
+data_paths:
+  # ProteInfer data paths
+  TRAIN_DATA_PATH: swissprot/proteinfer_splits/random/train_GO.fasta
+  TRAIN_2024_DATA_PATH: swissprot/proteinfer_splits/random/train_GO_jul_2024.fasta
+  VAL_DATA_PATH: swissprot/proteinfer_splits/random/dev_GO.fasta
+  TEST_DATA_PATH: swissprot/proteinfer_splits/random/test_GO.fasta
+  TEST_TOP_LABELS_DATA_PATH: swissprot/proteinfer_splits/random/test_top_labels_GO.fasta
+
+  TRAIN_CLUSTERED_DATA_PATH: swissprot/proteinfer_splits/clustered/train_GO.fasta
+  VAL_CLUSTERED_DATA_PATH: swissprot/proteinfer_splits/clustered/dev_GO.fasta
+  TEST_CLUSTERED_DATA_PATH: swissprot/proteinfer_splits/clustered/test_GO.fasta
+
+  FULL_DATA_PATH: swissprot/proteinfer_splits/random/full_GO.fasta # used to generate vocabularies
+  FULL_EC_DATA_PATH: swissprot/proteinfer_splits/random/full_EC.fasta # used to generate vocabularies
+
+  TEST_2024_DATA_PATH: swissprot/proteinfer_splits/random/test_GO_jul_2024.fasta
+  TEST_2024_PINF_VOCAB_DATA_PATH: swissprot/proteinfer_splits/random/test_GO_jul_2024_pinf_vocab.fasta
+
+  # Zero-shot data paths
+  TRAIN_DATA_PATH_ZERO_SHOT: swissprot/proteinfer_splits/random/fake_train_GO_zero_shot.fasta
+  VAL_DATA_PATH_ZERO_SHOT: swissprot/proteinfer_splits/random/fake_dev_GO_zero_shot.fasta
+  TEST_DATA_PATH_ZERO_SHOT: zero_shot/GO_swissprot_jul_2024.fasta
+  TEST_DATA_PATH_ZERO_SHOT_LEAF_NODES: zero_shot/GO_swissprot_leaf_nodes_jul_2024.fasta
+
+  #Other non-GO datasets to test zero shot
+  VAL_EC_DATA_PATH_ZERO_SHOT: zero_shot/dev_EC.fasta
+  TEST_EC_DATA_PATH_ZERO_SHOT: zero_shot/test_EC.fasta
+  FULL_EC_DATA_PATH: swissprot/proteinfer_splits/random/full_EC.fasta
+
+  # Vocabulary paths
+  VOCABULARIES_DIR: vocabularies/proteinfer
+  GO_ANNOTATIONS_PATH: annotations/go_annotations_jul_2024.pkl
+  GO_ANNOTATIONS_2024_07_PATH: annotations/go_annotations_jul_2024.pkl
+  GO_ANNOTATIONS_2019_UPDATED_PATH: annotations/go_annotations_2019_07_01_updated.pkl
+  GO_ANNOTATIONS_2025_10_PATH: annotations/go_annotations_2025_10_10.pkl
+  EC_ANNOTATIONS_PATH: annotations/ec_annotations.pkl
+
+  # Embeddings paths (if using frozen pre-trained models)
+  GO_BASE_LABEL_EMBEDDING_PATH: embeddings/frozen_label_embeddings.pt # this is the base path which is modified by POOLING_METHOD
+  GO_2024_BASE_LABEL_EMBEDDING_PATH: embeddings/2024_frozen_label_embeddings.pt
+  GO_2025_10_BASE_LABEL_EMBEDDING_PATH: embeddings/202510_frozen_label_embeddings.pt
+  EC_BASE_LABEL_EMBEDDING_PATH: embeddings/ecv1_frozen_label_embeddings.pt # this is the base path which is modified by POOLING_METHOD
+
+  # ProteInfer paths
+  PARENTHOOD_LIB_PATH: vocabularies/parenthood_2025_10.json
+  PROTEINFER_GO_WEIGHTS_PATH: models/proteinfer/GO_model_weights13703706.pkl
+  PROTEINFER_EC_WEIGHTS_PATH: models/proteinfer/EC_model_weights13703966.pkl
+
+  # SwissProt
+  LATEST_SWISSPROT_DATA_PATH: swissprot/uniprot_sprot_jul_2024.dat
+  2024_07_SWISSPROT_DATA_PATH: swissprot/uniprot_sprot_jul_2024.dat
+  2025_10_SWISSPROT_DATA_PATH: swissprot/uniprot_sprot_oct_2025.dat
+
+  # Legacy structural pipeline (only used with legacy residue-level EGNN, not hybrid encoder)
+  # These paths are for backward compatibility with the old PyG-based structural encoder
+  STRUCTURE_SOURCE: local   # local = PDB files already in PDB_DIR; alphafolddb = download from AlphaFoldDB into PDB_DIR first
+  PDB_DIR: pdb/             # Local directory for PDB/mmCIF files.
+  STRUCTURE_GRAPH_DIR: structure_graphs/
+  PLM_CACHE_DIR: plm_cache/
+  STRUCTURE_INDEX_PATH: structure_index.json  # sequence_id (UniProt ID) -> local pdb_path
+  STRUCTURE_GRAPH_PKL: structure_graphs/combined_graph_plm.pkl  # sequence_id -> (x, plm, edge_index, edge_s)
+  # Site ground truth for interpretability
+  INTERPRETABILITY_SITE_TSV_PATH: annotations/uniprotkb_keyword_KW_0800_site.tsv
+
+  # Atom-level structural pipeline (DEFAULT - used by hybrid ESM-C + EGNN encoder)
+  # Run bin/prepare_graph_data.py to generate the graph archive
+  STRUCTURE_DIR: structures/              # Directory containing CIF/PDB structure files
+  ESMC_EMBEDDING_DIR: embeddings/esmc/    # Directory containing ESM-C embeddings (.pt files)
+  ESMC_INDEX_PATH: embeddings/esmc/index.json  # sequence_id -> esmc_filename
+  PROCESSED_GRAPH_DIR: processed/         # Directory for processed atom-level graphs
+  GRAPH_INDEX_PATH: processed/graph_index.json  # sequence_id -> graph_filename
+  GRAPH_ARCHIVE_PATH: processed/graphs.pngrph   # Consolidated graph archive (optional)
+
+  SAMPLE_DATASET_FASTA: swissprot/new/protnote_expr.fasta
+
+# Paths referenced relative to OUTPUT_PATH (will have "outputs" prepended)
+output_paths:
+  # Where to save the model
+  OUTPUT_MODEL_DIR: checkpoints/
+
+  # Where to save results
+  RESULTS_DIR: results/
+
+  # Where to log
+  LOG_DIR: logs/

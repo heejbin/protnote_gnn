@@ -1,0 +1,13 @@
+# Remote data sources for downloading structures and data
+# Data & models published by original authors
+ZENODO_ORIGINAL_DATA: https://zenodo.org/records/13897920/files/data.zip?download=1
+
+# Modified data on HuggingFace
+HUGGINGFACE_DATA_REPO: cs527-toxinnote/protnote_data
+
+# RCSB PDB: https://www.rcsb.org/docs/programmatic-access/file-download-services
+RCSB_PDB_URL: https://files.rcsb.org/download
+
+# AlphaFold DB:
+ALPHAFOLD_DB_API: https://alphafold.ebi.ac.uk/api/prediction
+ALPHAFOLD_DB_URL: https://alphafold.ebi.ac.uk/files

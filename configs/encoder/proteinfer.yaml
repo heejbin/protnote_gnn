@@ -1,0 +1,10 @@
+# Constants for protein encoder model (e.g. ProteInfer). Not really params since
+# we are not going to change these.
+INPUT_CHANNELS: 20
+OUTPUT_CHANNELS: 1100
+KERNEL_SIZE: 9
+DILATION_BASE: 3
+NUM_RESNET_BLOCKS: 5
+BOTTLENECK_FACTOR: 0.5
+PROTEINFER_NUM_GO_LABELS: 32102
+PROTEINFER_NUM_EC_LABELS: 5134

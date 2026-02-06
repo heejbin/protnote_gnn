@@ -2,7 +2,9 @@ import subprocess
 from protnote.utils.notebooks import get_data_distributions
 from protnote.utils.data import read_fasta, save_to_fasta
 import pandas as pd
-from protnote.utils.configs import load_config, get_logger
+from protnote.utils.configs import get_project_root, get_logger, register_resolvers
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 logger = get_logger()
 
@@ -20,7 +22,7 @@ def create_smaller_test_sets(df,output_dir):
             temp,
             output_file=str(output_dir / f"test_{n}_GO.fasta"),
         )
-        
+
 
 
 def create_top_labels_test_set(df, output_path, go_term_distribution, k=3000):
@@ -49,9 +51,14 @@ if __name__ == "__main__":
 
 
     # Load the configuration and project root
-    config, project_root = load_config()
-    results_dir = config["paths"]["output_paths"]["RESULTS_DIR"]
-    
+    project_root = get_project_root()
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+        cfg = compose(config_name="config")
+
+    results_dir = project_root / "outputs" / cfg.paths.output_paths.RESULTS_DIR
+
     #Create fake train,val,test sets for hparam tuning
     logger.info("Creating fake train, val, test sets for hyperparameter tuning...")
     subprocess.run(["python", "bin/make_zero_shot_datasets_from_proteinfer.py"],check=True,shell=False)
@@ -64,9 +71,9 @@ if __name__ == "__main__":
             "python",
             "bin/make_dataset_from_swissprot.py",
             "--latest-swissprot-file",
-            config["paths"]['data_paths']['LATEST_SWISSPROT_DATA_PATH'],
+            str(project_root / "data" / cfg.paths.data_paths.LATEST_SWISSPROT_DATA_PATH),
             "--output-file-path",
-            config["paths"]['data_paths']['TEST_2024_DATA_PATH'],
+            str(project_root / "data" / cfg.paths.data_paths.TEST_2024_DATA_PATH),
             "--sequence-vocabulary",
             "proteinfer_test",
             "--label-vocabulary",
@@ -86,9 +93,9 @@ if __name__ == "__main__":
             "python",
             "bin/make_dataset_from_swissprot.py",
             "--latest-swissprot-file",
-            config["paths"]['data_paths']['LATEST_SWISSPROT_DATA_PATH'],
+            str(project_root / "data" / cfg.paths.data_paths.LATEST_SWISSPROT_DATA_PATH),
             "--output-file-path",
-            config["paths"]['data_paths']['TEST_2024_PINF_VOCAB_DATA_PATH'],
+            str(project_root / "data" / cfg.paths.data_paths.TEST_2024_PINF_VOCAB_DATA_PATH),
             "--sequence-vocabulary",
             "proteinfer_test",
             "--label-vocabulary",
@@ -108,9 +115,9 @@ if __name__ == "__main__":
             "python",
             "bin/make_dataset_from_swissprot.py",
             "--latest-swissprot-file",
-            config["paths"]['data_paths']['LATEST_SWISSPROT_DATA_PATH'],
+            str(project_root / "data" / cfg.paths.data_paths.LATEST_SWISSPROT_DATA_PATH),
             "--output-file-path",
-            config["paths"]['data_paths']['TEST_DATA_PATH_ZERO_SHOT_LEAF_NODES'],
+            str(project_root / "data" / cfg.paths.data_paths.TEST_DATA_PATH_ZERO_SHOT_LEAF_NODES),
             "--sequence-vocabulary",
             "new",
             "--only-leaf-nodes",
@@ -131,9 +138,9 @@ if __name__ == "__main__":
             "python",
             "bin/make_dataset_from_swissprot.py",
             "--latest-swissprot-file",
-            config["paths"]['data_paths']['LATEST_SWISSPROT_DATA_PATH'],
+            str(project_root / "data" / cfg.paths.data_paths.LATEST_SWISSPROT_DATA_PATH),
             "--output-file-path",
-            config["paths"]['data_paths']['TEST_DATA_PATH_ZERO_SHOT'],
+            str(project_root / "data" / cfg.paths.data_paths.TEST_DATA_PATH_ZERO_SHOT),
             "--sequence-vocabulary",
             "new",
             "--label-vocabulary",
@@ -153,9 +160,9 @@ if __name__ == "__main__":
             "python",
             "bin/make_dataset_from_swissprot.py",
             "--latest-swissprot-file",
-            config["paths"]['data_paths']['LATEST_SWISSPROT_DATA_PATH'],
+            str(project_root / "data" / cfg.paths.data_paths.LATEST_SWISSPROT_DATA_PATH),
             "--output-file-path",
-            config["paths"]['data_paths']['TRAIN_2024_DATA_PATH'],
+            str(project_root / "data" / cfg.paths.data_paths.TRAIN_2024_DATA_PATH),
             "--sequence-vocabulary",
             "proteinfer_train",
             "--label-vocabulary",
@@ -168,8 +175,8 @@ if __name__ == "__main__":
     )
     logger.info("Done.")
 
-    train = read_fasta(config["paths"]['data_paths']['TRAIN_DATA_PATH'])
-    test = read_fasta(config["paths"]['data_paths']['TEST_DATA_PATH'])
+    train = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TRAIN_DATA_PATH))
+    test = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TEST_DATA_PATH))
 
     for dataset in ["train", "test"]:
         exec(
@@ -189,10 +196,10 @@ if __name__ == "__main__":
                              output_dir = project_root / "data" / "swissprot" / "proteinfer_splits" / "random"
                              )
     logger.info("Done.")
-    
+
     logger.info("Create top labels test set for embeddings analysis.")
     create_top_labels_test_set(df = df,
-                               output_path= config["paths"]['data_paths']['TEST_TOP_LABELS_DATA_PATH'],
+                               output_path= str(project_root / "data" / cfg.paths.data_paths.TEST_TOP_LABELS_DATA_PATH),
                                go_term_distribution=go_term_distribution
                                )
     logger.info("Done.")

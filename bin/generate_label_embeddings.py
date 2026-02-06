@@ -7,14 +7,16 @@ import numpy as np
 import pandas as pd
 from transformers import AutoTokenizer, AutoModel
 from protnote.utils.models import generate_label_embeddings_from_text
-from protnote.utils.configs import generate_label_embedding_path
+from protnote.utils.configs import generate_label_embedding_path, get_project_root, register_resolvers
 from protnote.utils.data import (
-    read_yaml,
     read_pickle,
     remove_obsolete_from_string,
     ensure_list,
 )
-from protnote.utils.configs import get_project_root
+
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
+from omegaconf import OmegaConf
 
 logging.basicConfig(level=logging.INFO)
 
@@ -70,20 +72,24 @@ def main():
 
     args = parser.parse_args()
 
-    ROOT_PATH =  get_project_root()
-    CONFIG = read_yaml(ROOT_PATH / "configs" / "base_config.yaml")
+    ROOT_PATH = get_project_root()
     TASK = "Identify the main categories, themes, or topics described in the following Gene Ontology (GO) term, which is used to detail a protein's function"
 
-    # Overwrite config pooling method
-    CONFIG["params"]["LABEL_EMBEDDING_POOLING_METHOD"] = args.pooling_method
-    CONFIG["params"]["LABEL_ENCODER_CHECKPOINT"] = args.label_encoder_checkpoint
+    # Load config via Hydra Compose API
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(ROOT_PATH / "configs")):
+        cfg = compose(config_name="config", overrides=[
+            f"params.LABEL_EMBEDDING_POOLING_METHOD={args.pooling_method}",
+            f"params.LABEL_ENCODER_CHECKPOINT={args.label_encoder_checkpoint}",
+        ])
 
     DATA_PATH = ROOT_PATH / "data"
     OUTPUT_PATH = os.path.join(
         DATA_PATH,
         generate_label_embedding_path(
-            params=CONFIG["params"],
-            base_label_embedding_path=CONFIG["paths"]["data_paths"][
+            params=OmegaConf.to_container(cfg.params, resolve=True),
+            base_label_embedding_path=cfg.paths.data_paths[
                 args.base_label_embedding_path
             ],
         ),
@@ -97,7 +103,7 @@ def main():
     )
 
     ANNOTATIONS_PATH = os.path.join(
-        DATA_PATH, CONFIG["paths"]["data_paths"][args.annotations_path_name]
+        DATA_PATH, cfg.paths.data_paths[args.annotations_path_name]
     )
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -151,7 +157,7 @@ def main():
         label_tokenizer=label_tokenizer,
         label_encoder=label_encoder,
         pooling_method=args.pooling_method,
-        batch_size_limit=CONFIG["params"]["LABEL_BATCH_SIZE_LIMIT_NO_GRAD"],
+        batch_size_limit=cfg.params.LABEL_BATCH_SIZE_LIMIT_NO_GRAD,
         append_in_cpu=False,
         account_for_sos=args.account_for_sos,
     ).to("cpu")
@@ -168,7 +174,7 @@ def main():
 
 if __name__ == "__main__":
     '''
-    Example usage: 
+    Example usage:
 
 python bin/generate_label_embeddings.py --add-instruction --account-for-sos
 python bin/generate_label_embeddings.py --label-encoder-checkpoint microsoft/biogpt --account-for-sos
@@ -179,6 +185,6 @@ python bin/generate_label_embeddings.py --base-label-embedding-path EC_BASE_LABE
 python bin/generate_label_embeddings.py --base-label-embedding-path GO_2024_BASE_LABEL_EMBEDDING_PATH --annotations-path-name GO_ANNOTATIONS_PATH --add-instruction --account-for-sos
 python bin/generate_label_embeddings.py --base-label-embedding-path GO_2024_BASE_LABEL_EMBEDDING_PATH --annotations-path-name GO_ANNOTATIONS_PATH --label-encoder-checkpoint microsoft/biogpt --account-for-sos
 
-    
+
     '''
     main()

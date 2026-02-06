@@ -276,7 +276,20 @@ class ProtNoteTrainer:
         :return: batch loss, logits and labels
         :rtype: tuple
         """
-        if self.use_structural_encoder:
+        if "graph_data" in batch:
+            # Atom-level format (ESM-C + EGNN)
+            graph_data = batch["graph_data"]
+            sequence_ids = batch.get("sequence_ids", [])
+            label_multihots = batch["label_multihots"]
+            label_embeddings = batch["label_embeddings"]
+            # Move graph_data tensors to device
+            graph_data = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in graph_data.items()}
+            label_multihots, label_embeddings = self._to_device(label_multihots, label_embeddings)
+            inputs = {
+                "graph_data": graph_data,
+                "label_embeddings": label_embeddings,
+            }
+        elif self.use_structural_encoder:
             structure_batch = batch["structure_batch"]
             sequence_ids = batch.get("sequence_ids", [])
             label_multihots = batch["label_multihots"]
@@ -718,8 +731,25 @@ class ProtNoteTrainer:
         for batch_idx, batch in enumerate(train_loader):
             self.training_step += 1
 
-            # Unpack the training batch (structural vs sequence mode)
-            if self.use_structural_encoder:
+            # Unpack the training batch (atom-level, structural, or sequence mode)
+            if "graph_data" in batch:
+                # Atom-level format (ESM-C + EGNN)
+                graph_data = batch["graph_data"]
+                sequence_ids = batch.get("sequence_ids", [])
+                label_multihots = batch["label_multihots"]
+                label_embeddings = batch["label_embeddings"]
+                label_token_counts = batch["label_token_counts"]
+                # Move graph_data tensors to device
+                graph_data = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in graph_data.items()}
+                label_multihots, label_embeddings, label_token_counts = self._to_device(
+                    label_multihots, label_embeddings, label_token_counts
+                )
+                inputs = {
+                    "graph_data": graph_data,
+                    "label_embeddings": label_embeddings,
+                    "label_token_counts": label_token_counts,
+                }
+            elif self.use_structural_encoder:
                 structure_batch = batch["structure_batch"]
                 sequence_ids = batch.get("sequence_ids", [])
                 label_multihots = batch["label_multihots"]

@@ -1,14 +1,22 @@
 """
 E(3) Equivariant GNN for structural protein encoding.
 Ported from StrucToxNet (Jiao et al.) for use as ProtNote's protein branch.
+
+Updated to support atom-level graphs with ESM-C embeddings.
 """
+
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 try:
     import torch_scatter
 except ImportError:
     torch_scatter = None
+
+
+# Default atom type dimension for one-hot encoding (covers common protein elements)
+ATOM_TYPE_DIM = 37
 
 
 def unsorted_segment_sum(data, segment_ids, num_segments):
@@ -114,7 +122,7 @@ class E_GCL(nn.Module):
     def coord2radial(self, edge_index, coord):
         row, col = edge_index[0], edge_index[1]
         coord_diff = coord[row] - coord[col]
-        radial = torch.sum(coord_diff ** 2, 1).unsqueeze(1)
+        radial = torch.sum(coord_diff**2, 1).unsqueeze(1)
         if self.normalize:
             norm = torch.sqrt(radial).detach() + self.epsilon
             coord_diff = coord_diff / norm
@@ -131,7 +139,11 @@ class E_GCL(nn.Module):
 class StructuralProteinEncoder(nn.Module):
     """
     Structural-Sequential encoder: PLM node features + EGNN -> graph-level embedding.
-    Interface compatible with ProtNote's sequence_encoder: get_embeddings(batch) -> (N, protein_embedding_dim).
+    Interface compatible with ProtNote's sequence_encoder.
+
+    Supports two input formats:
+    - Legacy PyG Batch format: get_embeddings(batch) with .x, .plm, .edge_index, .edge_s, .batch
+    - Atom-level dict format: get_embeddings(**graph_data) with ESM-C + atom-type features
     """
 
     def __init__(
@@ -147,30 +159,48 @@ class StructuralProteinEncoder(nn.Module):
         attention=False,
         normalize=False,
         tanh=False,
+        # New params for atom-level input
+        atom_type_dim=ATOM_TYPE_DIM,
+        use_atom_level=False,
     ):
         super().__init__()
         if torch_scatter is None:
             raise ImportError("StructuralProteinEncoder requires torch_scatter. Install with: pip install torch_scatter")
+
         self.plm_embedding_dim = plm_embedding_dim
         self.protein_embedding_dim = protein_embedding_dim
         self.hidden_nf = hidden_nf
         self.num_layers = num_layers
+        self.use_atom_level = use_atom_level
+        self.atom_type_dim = atom_type_dim
 
-        self.W_v = nn.Linear(plm_embedding_dim, hidden_nf, bias=True)
-        self.gcl_layers = nn.ModuleList([
-            E_GCL(
-                hidden_nf,
-                hidden_nf,
-                hidden_nf,
-                edges_in_d=in_edge_nf,
-                act_fn=act_fn,
-                residual=residual,
-                attention=attention,
-                normalize=normalize,
-                tanh=tanh,
-            )
-            for _ in range(num_layers)
-        ])
+        # Input dimension depends on mode
+        if use_atom_level:
+            # Atom-level: ESM-C + atom-type one-hot
+            in_node_dim = plm_embedding_dim + atom_type_dim
+            self.in_edge_nf = 0  # No explicit edge features for atom-level
+        else:
+            # Legacy residue-level
+            in_node_dim = plm_embedding_dim
+            self.in_edge_nf = in_edge_nf
+
+        self.W_v = nn.Linear(in_node_dim, hidden_nf, bias=True)
+        self.gcl_layers = nn.ModuleList(
+            [
+                E_GCL(
+                    hidden_nf,
+                    hidden_nf,
+                    hidden_nf,
+                    edges_in_d=self.in_edge_nf,
+                    act_fn=act_fn,
+                    residual=residual,
+                    attention=attention,
+                    normalize=normalize,
+                    tanh=tanh,
+                )
+                for _ in range(num_layers)
+            ]
+        )
         # Map pooled hidden_nf -> protein_embedding_dim (e.g. 1100 for ProtNote W_p)
         self.projection = nn.Sequential(
             nn.Linear(hidden_nf, 256),
@@ -181,6 +211,7 @@ class StructuralProteinEncoder(nn.Module):
 
     def forward(self, batch):
         """
+        Legacy forward for PyG Batch format.
         batch: PyG Batch with .x (coords), .plm (node PLM embeddings), .edge_index, .edge_s, .batch
         """
         x = batch.x
@@ -191,10 +222,70 @@ class StructuralProteinEncoder(nn.Module):
         out = torch_scatter.scatter_max(h, batch.batch, dim=0)[0].float()
         return self.projection(out)
 
-    def get_embeddings(self, batch):
+    def forward_atom_level(
+        self,
+        esmc_embeddings,
+        atom_coords,
+        atom_types,
+        edge_index,
+        atom_to_protein,
+        num_proteins,
+        **kwargs,
+    ):
         """
-        Same interface as ProteInfer.get_embeddings for drop-in replacement in ProtNote.
-        batch: PyG Batch (structure_batch) with .x, .plm, .edge_index, .edge_s, .batch
-        Returns: (batch_size, protein_embedding_dim)
+        Forward pass for atom-level graph data.
+
+        Args:
+            esmc_embeddings: Per-atom ESM-C embeddings [N_atoms, esmc_dim]
+            atom_coords: Atom 3D coordinates [N_atoms, 3]
+            atom_types: Atom type indices [N_atoms] or one-hot [N_atoms, atom_type_dim]
+            edge_index: Edge indices [2, N_edges]
+            atom_to_protein: Protein index for each atom [N_atoms]
+            num_proteins: Number of proteins in batch
+
+        Returns:
+            protein_embeddings: [num_proteins, protein_embedding_dim]
         """
-        return self.forward(batch)
+        # Convert atom_types to one-hot if needed
+        if atom_types.dim() == 1:
+            atom_types_onehot = F.one_hot(atom_types, num_classes=self.atom_type_dim).float()
+        else:
+            atom_types_onehot = atom_types.float()
+
+        # Concatenate ESM-C with atom-type one-hot
+        h = torch.cat([esmc_embeddings, atom_types_onehot], dim=-1)
+        x = atom_coords.float()
+
+        # Project to hidden dim
+        h = self.W_v(h)
+
+        # Run through EGNN layers (no edge attributes for atom-level)
+        for gcl in self.gcl_layers:
+            h, x, _ = gcl(h, edge_index, x, edge_attr=None)
+
+        # Global max pooling per protein
+        out = torch_scatter.scatter_max(h, atom_to_protein, dim=0)[0].float()
+
+        return self.projection(out)
+
+    def get_embeddings(self, batch_or_data=None, **kwargs):
+        """
+        Unified interface supporting both input formats.
+
+        For legacy PyG Batch:
+            get_embeddings(batch) where batch has .x, .plm, .edge_index, .edge_s, .batch
+
+        For atom-level dict:
+            get_embeddings(esmc_embeddings=..., atom_coords=..., atom_types=...,
+                          edge_index=..., atom_to_protein=..., num_proteins=...)
+        """
+        # Check if called with keyword args (atom-level format)
+        if batch_or_data is None and kwargs:
+            return self.forward_atom_level(**kwargs)
+
+        # Check if batch_or_data is a dict (atom-level format)
+        if isinstance(batch_or_data, dict):
+            return self.forward_atom_level(**batch_or_data)
+
+        # Otherwise assume PyG Batch (legacy format)
+        return self.forward(batch_or_data)

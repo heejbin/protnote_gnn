@@ -4,7 +4,9 @@ warnings.simplefilter("ignore")
 from tqdm import tqdm
 import argparse
 from protnote.utils.data import read_fasta, generate_vocabularies
-from protnote.utils.configs import load_config,construct_absolute_paths, get_project_root
+from protnote.utils.configs import get_project_root, register_resolvers
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from protnote.models.blast import BlastTopHits
 from protnote.utils.data import tqdm_joblib
 import pandas as pd
@@ -14,9 +16,14 @@ from joblib import Parallel, delayed
 import numpy as np
 
 
-# Load the configuration and project root
-config, project_root = load_config()
-results_dir = config["paths"]["output_paths"]["RESULTS_DIR"]
+# Load the configuration and project root using Hydra Compose API
+project_root = get_project_root()
+register_resolvers()
+GlobalHydra.instance().clear()
+with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+    cfg = compose(config_name="config")
+
+results_dir = project_root / "outputs" / cfg.paths.output_paths.RESULTS_DIR
 
 
 def main():
@@ -31,7 +38,7 @@ def main():
         "--train-data-path",
         type=str,
         required=False,
-        default=config["paths"]["data_paths"]["TRAIN_DATA_PATH"],
+        default=str(project_root / "data" / cfg.paths.data_paths.TRAIN_DATA_PATH),
         help="The train databse of sequences",
     )
 
@@ -150,7 +157,7 @@ def main():
     logger.info(f"Parse Duration: {bth.parse_results_duration_seconds}")
 
     # Save the search and parse duration in a csv file, along with the size of query set
-    
+
     if args.save_runtime_info:
         search_parse_duration = pd.DataFrame(
             {
@@ -165,10 +172,10 @@ def main():
 
 if __name__ == "__main__":
     """
-    sample usage: 
-    
+    sample usage:
+
     python run_blast.py --test-data-path data/swissprot/proteinfer_splits/random/test_GO.fasta --train-data-path data/swissprot/proteinfer_splits/random/train_GO.fasta
-    
+
 
     # List of numbers to iterate over
     numbers=(1 10 100 1000 5000 10000 20000)  # Modify this list with your actual numbers
@@ -181,7 +188,6 @@ if __name__ == "__main__":
 
     python bin/run_blast.py --test-data-path data/swissprot/proteinfer_splits/random/test_GO.fasta --train-data-path data/swissprot/proteinfer_splits/random/train_GO.fasta --save-runtime-info;
 
-    
 
 
 
@@ -199,4 +205,3 @@ if __name__ == "__main__":
     main()
 
 #!/bin/bash
-

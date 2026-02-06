@@ -6,7 +6,9 @@ from tqdm import tqdm
 import argparse
 import matplotlib.pyplot as plt
 from protnote.utils.notebooks import *
-from protnote.utils.configs import load_config, construct_absolute_paths
+from protnote.utils.configs import get_project_root, construct_absolute_paths, register_resolvers
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 
 
 
@@ -14,14 +16,19 @@ def main():
     seeds = [12, 22, 32, 42, 52]
     pinf_model_ids = [13703706, 13703742, 13703997, 13704131, 13705631]
 
-    # Load the configuration and project root
-    config, project_root = load_config()
-    results_dir = config["paths"]["output_paths"]["RESULTS_DIR"]
+    # Load the configuration and project root using Hydra Compose API
+    project_root = get_project_root()
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+        cfg = compose(config_name="config")
+
+    results_dir = project_root / "outputs" / cfg.paths.output_paths.RESULTS_DIR
 
     # Argument parser setup
     parser = argparse.ArgumentParser(
         description="""
-            Calculate the metrics for protnote,proteinfer and blast on the same test set given predictions for each. 
+            Calculate the metrics for protnote,proteinfer and blast on the same test set given predictions for each.
             It's design for multiple predictions per model (except blast), one for each seed.
             """
         )

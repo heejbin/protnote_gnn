@@ -10,8 +10,10 @@ from torcheval.metrics import MultilabelAUPRC, BinaryAUPRC
 import pandas as pd
 import subprocess
 from protnote.utils.evaluation import EvalMetrics
-from protnote.utils.data import generate_vocabularies, read_yaml
-from protnote.utils.configs import load_config, construct_absolute_paths
+from protnote.utils.data import generate_vocabularies
+from protnote.utils.configs import get_project_root, register_resolvers
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from test_models import TEST_COMMANDS, MODEL_PATH_TOKEN, MODEL_NAME_TOKEN
 
 #TODO: This could be more general by eliminating unnecessary dependencies and passing the embedding file names as arguments
@@ -22,15 +24,20 @@ def main(
     model_name: str,
     cache: bool,
 ):
-    
-    # Load the configuration and project root
-    config, project_root = load_config()
-    results_dir = config["paths"]["output_paths"]["RESULTS_DIR"]
-    full_data_path = config["paths"]['data_paths']['FULL_DATA_PATH']
+
+    # Load the configuration and project root using Hydra Compose API
+    project_root = get_project_root()
+    register_resolvers()
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(version_base=None, config_dir=str(project_root / "configs")):
+        cfg = compose(config_name="config")
+
+    results_dir = project_root / "outputs" / cfg.paths.output_paths.RESULTS_DIR
+    full_data_path = project_root / "data" / cfg.paths.data_paths.FULL_DATA_PATH
     proteinfer_predictions_path = results_dir / f"test_logits_{annotation_type}_{test_name}_proteinfer.h5"
     protnote_labels_path = results_dir / f"test_1_labels_{test_name}_{model_name}.h5"
     output_file = results_dir / f"test_logits_{annotation_type}_{test_name}_{label_embedding_model}_baseline.h5"
-    
+
 
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
@@ -77,7 +84,7 @@ def main(
         subprocess.run(
             TEST_COMMANDS[test_name]
             .replace(MODEL_PATH_TOKEN, f"{model_name}.pt")
-            .replace(MODEL_NAME_TOKEN, model_name) + " --save-prediction-results",
+            .replace(MODEL_NAME_TOKEN, model_name) + " run.save_prediction_results=true",
             shell=True,
         )
 
@@ -221,5 +228,3 @@ if __name__ == "__main__":
         label_embedding_model=args.label_embedding_model,
         cache=args.cache,
     )
-
-
