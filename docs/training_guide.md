@@ -198,6 +198,26 @@ python bin/prepare_graph_data.py \
 | `--num-workers` | `8` | Parallel processing workers |
 | `--knn-k` | `20` | Number of k-nearest-neighbor edges per atom |
 | `--consolidate` | off | Merge all graphs into a single `.pngrph` archive |
+| `--local-afdb` | off | Use a local folder of AFDB PDB files instead of downloaded CIF files |
+
+**Using local AlphaFoldDB structures:**
+
+If you have a local copy of AlphaFold DB structure files (e.g., from a bulk download), you can use them instead of individually downloaded CIF files. Set the config keys in `configs/paths/default.yaml`:
+
+```yaml
+LOCAL_AFDB_DIR: structures/local_afdb/    # folder containing the PDB files
+LOCAL_AFDB_SUFFIX: v4                      # model version suffix
+```
+
+Then pass `--local-afdb`:
+
+```bash
+python bin/prepare_graph_data.py \
+    --num-workers 8 \
+    --local-afdb
+```
+
+Files are expected to be named `AF-<UNIPROT_ID>-F1-model_<SUFFIX>.pdb` (e.g., `AF-P12345-F1-model_v4.pdb`). This only affects proteins whose structure index entry has `"source": "alphafolddb"` — PDB-sourced structures are resolved normally.
 
 Output: `data/processed/graphs.pngrph` (archive) + `data/processed/graph_index.json`.
 

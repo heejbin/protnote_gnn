@@ -72,6 +72,11 @@ data_paths:
   GRAPH_INDEX_PATH: processed/graph_index.json  # sequence_id -> graph_filename
   GRAPH_ARCHIVE_PATH: processed/graphs.pngrph   # Consolidated graph archive (optional)
 
+  # Local AlphaFoldDB structures (alternative to downloaded CIF files)
+  # Files expected as: <LOCAL_AFDB_DIR>/AF-<UNIPROT_ID>-F1-model_<LOCAL_AFDB_SUFFIX>.pdb
+  LOCAL_AFDB_DIR: ""              # e.g. "structures/local_afdb/"
+  LOCAL_AFDB_SUFFIX: v4           # e.g. "v4" → AF-P12345-F1-model_v4.pdb
+
   SAMPLE_DATASET_FASTA: swissprot/new/protnote_expr.fasta
 
 # Paths referenced relative to OUTPUT_PATH (will have "outputs" prepended)

@@ -55,7 +55,7 @@ def collect_sequences_map(fasta_paths: list[Path]) -> dict[str, str]:
 _worker_ctx = {}
 
 
-def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_map, knn_k):
+def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_map, knn_k, local_afdb_dir=None, local_afdb_suffix=None):
     """Called once per worker process to store shared config and import heavy modules."""
     _worker_ctx["structure_dir"] = Path(structure_dir)
     _worker_ctx["esmc_dir"] = Path(esmc_dir)
@@ -63,6 +63,8 @@ def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_
     _worker_ctx["esmc_index"] = esmc_index
     _worker_ctx["sequence_map"] = sequence_map
     _worker_ctx["knn_k"] = knn_k
+    _worker_ctx["local_afdb_dir"] = Path(local_afdb_dir) if local_afdb_dir else None
+    _worker_ctx["local_afdb_suffix"] = local_afdb_suffix
 
     # Import heavy modules once per worker (avoid repeated import overhead)
     from protnote.utils.structure import (
@@ -89,7 +91,16 @@ def _process_one(seq_id: str) -> dict:
     ctx = _worker_ctx
     try:
         struct_info = ctx["structure_index"][seq_id]
-        cif_path = ctx["structure_dir"] / struct_info["path"]
+
+        # Resolve structure file path: use local AFDB folder for alphafolddb entries if configured
+        if (
+            ctx["local_afdb_dir"]
+            and struct_info.get("source") == "alphafolddb"
+        ):
+            afdb_filename = f"AF-{seq_id}-F1-model_{ctx['local_afdb_suffix']}.pdb"
+            cif_path = ctx["local_afdb_dir"] / afdb_filename
+        else:
+            cif_path = ctx["structure_dir"] / struct_info["path"]
 
         if not cif_path.exists():
             return {"seq_id": seq_id, "status": "failed", "reason": "structure_file_missing"}
@@ -196,6 +207,13 @@ def main():
         default=False,
         help="Keep individual .pt files after archiving (default: delete them).",
     )
+    parser.add_argument(
+        "--local-afdb",
+        action="store_true",
+        default=False,
+        help="Use local AFDB folder for alphafolddb structures instead of downloaded CIF files. "
+        "Expects files named AF-<UNIPROT_ID>-F1-model_<SUFFIX>.pdb in LOCAL_AFDB_DIR.",
+    )
     args = parser.parse_args()
 
     from hydra import compose, initialize_config_dir
@@ -218,6 +236,21 @@ def main():
     )
     esmc_dir = Path(DATA_PATH / cfg.paths.data_paths.get("ESMC_EMBEDDING_DIR", "embeddings/esmc"))
     esmc_index_path = Path(DATA_PATH / cfg.paths.data_paths.get("ESMC_INDEX_PATH", "embeddings/esmc/esmc_index.json"))
+
+    # Local AFDB configuration
+    local_afdb_dir = None
+    local_afdb_suffix = None
+    if args.local_afdb:
+        local_afdb_rel = cfg.paths.data_paths.get("LOCAL_AFDB_DIR", "")
+        if not local_afdb_rel:
+            logger.error("--local-afdb requires LOCAL_AFDB_DIR to be set in config.")
+            return
+        local_afdb_dir = Path(DATA_PATH / local_afdb_rel)
+        local_afdb_suffix = cfg.paths.data_paths.get("LOCAL_AFDB_SUFFIX", "v4")
+        if not local_afdb_dir.exists():
+            logger.error(f"Local AFDB directory not found: {local_afdb_dir}")
+            return
+        logger.info(f"Using local AFDB structures from {local_afdb_dir} (suffix={local_afdb_suffix})")
 
     if not structure_index_path.exists():
         logger.error(f"Structure index not found: {structure_index_path}. Run download_structures.py first.")
@@ -287,6 +320,8 @@ def main():
                     esmc_index,
                     sequence_map,
                     knn_k,
+                    str(local_afdb_dir) if local_afdb_dir else None,
+                    local_afdb_suffix,
                 ),
             ) as pool:
                 results = pool.imap_unordered(_process_one, remaining, chunksize=args.chunksize)
@@ -315,6 +350,8 @@ def main():
                 esmc_index,
                 sequence_map,
                 knn_k,
+                str(local_afdb_dir) if local_afdb_dir else None,
+                local_afdb_suffix,
             )
             for seq_id in tqdm(remaining, desc="Preparing graph data"):
                 result = _process_one(seq_id)
