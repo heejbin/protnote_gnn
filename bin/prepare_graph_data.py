@@ -162,6 +162,7 @@ def _process_one(seq_id: str) -> dict:
             "seq_id": seq_id,
             "status": "ok",
             "filename": f"{seq_id}.pt",
+            "n_atoms": output["n_atoms"],
             "data_bytes": buf.getvalue(),
         }
 
@@ -330,7 +331,10 @@ def main():
                         out_path = output_dir / result["filename"]
                         with open(out_path, "wb") as f:
                             f.write(result["data_bytes"])
-                        graph_index[result["seq_id"]] = result["filename"]
+                        graph_index[result["seq_id"]] = {
+                            "filename": result["filename"],
+                            "n_atoms": result["n_atoms"],
+                        }
                         processed += 1
 
                         if processed % 500 == 0:
@@ -359,7 +363,10 @@ def main():
                     out_path = output_dir / result["filename"]
                     with open(out_path, "wb") as f:
                         f.write(result["data_bytes"])
-                    graph_index[result["seq_id"]] = result["filename"]
+                    graph_index[result["seq_id"]] = {
+                        "filename": result["filename"],
+                        "n_atoms": result["n_atoms"],
+                    }
                     processed += 1
 
                     if processed % 500 == 0:
@@ -390,8 +397,8 @@ def main():
         if n_archived > 0 and not args.keep_individual_files:
             logger.info("Removing individual .pt files...")
             removed = 0
-            for filename in graph_index.values():
-                pt_path = output_dir / filename
+            for entry in graph_index.values():
+                pt_path = output_dir / entry["filename"]
                 if pt_path.exists():
                     pt_path.unlink()
                     removed += 1
@@ -409,7 +416,7 @@ def main():
             sample = reader[sample_id]
             reader.close()
         else:
-            sample = torch.load(output_dir / graph_index[sample_id], weights_only=False)
+            sample = torch.load(output_dir / graph_index[sample_id]["filename"], weights_only=False)
         logger.info(
             f"Sample output ({sample_id}): "
             f"atoms={sample['n_atoms']}, residues={sample['n_residues']}, "

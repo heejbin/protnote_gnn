@@ -221,6 +221,8 @@ Files are expected to be named `AF-<UNIPROT_ID>-F1-model_<SUFFIX>.pdb` (e.g., `A
 
 Output: `data/processed/graphs.pngrph` (archive) + `data/processed/graph_index.json`.
 
+**Graph index format**: Each entry in `graph_index.json` is `{"filename": "SEQ_ID.pt", "n_atoms": 1234}`. The `n_atoms` field is used by the dynamic batch sampler to group proteins by atom count.
+
 ### Data Preparation Summary
 
 | Step | Script | Required For | Output |
@@ -281,9 +283,10 @@ These control what the training script does:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `TRAIN_BATCH_SIZE` | `2` | Per-GPU training batch size |
-| `VALIDATION_BATCH_SIZE` | `2` | Per-GPU validation batch size |
-| `TEST_BATCH_SIZE` | `8` | Per-GPU test batch size |
+| `TRAIN_BATCH_SIZE` | `2` | Per-GPU training batch size (used when `MAX_ATOMS_PER_BATCH` is null) |
+| `VALIDATION_BATCH_SIZE` | `2` | Per-GPU validation batch size (used when `MAX_ATOMS_PER_BATCH` is null) |
+| `TEST_BATCH_SIZE` | `8` | Per-GPU test batch size (used when `MAX_ATOMS_PER_BATCH` is null) |
+| `MAX_ATOMS_PER_BATCH` | `null` | Max total atoms per batch for dynamic batching (null = use fixed batch size) |
 | `WEIGHTED_SAMPLING` | `true` | Over-sample rare sequences by inverse label frequency |
 | `INV_FREQUENCY_POWER` | `0.5` | Power for inverse frequency weighting |
 | `TRAIN_LABEL_SAMPLE_SIZE` | `null` | Sample K labels per batch (null = all) |
@@ -706,6 +709,13 @@ python bin/main.py \
 ```
 
 ### 8.7 Common Override Recipes
+
+**Enable dynamic batching by atom count (prevents OOM from large proteins):**
+```bash
+params.MAX_ATOMS_PER_BATCH=15000
+# Batch size varies per batch — small proteins get larger batches, large proteins get smaller ones
+# Requires atom-level mode with n_atoms in graph_index.json (produced by prepare_graph_data.py)
+```
 
 **Increase batch size with gradient accumulation (for limited GPU memory):**
 ```bash

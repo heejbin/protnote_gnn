@@ -193,7 +193,7 @@ class ProteinStructureDataset(Dataset):
 
         # Then try individual file
         if sequence_id in self.graph_index:
-            graph_path = os.path.join(self.graph_dir, self.graph_index[sequence_id])
+            graph_path = os.path.join(self.graph_dir, self.graph_index[sequence_id]["filename"])
             try:
                 graph_data = torch.load(graph_path, weights_only=False)
                 return graph_data
@@ -290,6 +290,13 @@ class ProteinStructureDataset(Dataset):
             self.label_embeddings[label_embedding_idxs_list],
             self.label_token_counts[label_embedding_idxs_list],
         )
+
+    def get_atom_counts(self):
+        """Return an array of atom counts aligned with dataset indices."""
+        counts = np.empty(len(self.data), dtype=np.int64)
+        for i, (_sequence, seq_id, _labels) in enumerate(self.data):
+            counts[i] = self.graph_index[seq_id]["n_atoms"]
+        return counts
 
     def __len__(self):
         return len(self.data)
@@ -416,7 +423,9 @@ def create_structural_loaders(
     from torch.utils.data import DataLoader
 
     from protnote.data.collators import collate_structure_batch
-    from protnote.data.samplers import observation_sampler_factory
+    from protnote.data.samplers import DynamicBatchSampler, observation_sampler_factory
+
+    max_atoms = params.get("MAX_ATOMS_PER_BATCH")
 
     loaders = defaultdict(list)
     for dataset_type, dataset_list in datasets.items():
@@ -432,23 +441,46 @@ def create_structural_loaders(
                 sequence_weights=sequence_weights,
                 shuffle=(dataset_type == "train"),
             )
-            loader = DataLoader(
-                dataset,
-                batch_size=batch_size_for_type,
-                shuffle=False,
-                collate_fn=partial(
-                    collate_structure_batch,
-                    label_sample_size=label_sample_size,
-                    distribute_labels=params.get("DISTRIBUTE_LABELS", False),
-                    shuffle_labels=shuffle_labels,
-                    in_batch_sampling=in_batch_sampling and (dataset_type == "train"),
-                    world_size=world_size,
-                    rank=rank,
-                ),
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                drop_last=(dataset_type == "train"),
-                sampler=sequence_sampler,
+            collate_fn = partial(
+                collate_structure_batch,
+                label_sample_size=label_sample_size,
+                distribute_labels=params.get("DISTRIBUTE_LABELS", False),
+                shuffle_labels=shuffle_labels,
+                in_batch_sampling=in_batch_sampling and (dataset_type == "train"),
+                world_size=world_size,
+                rank=rank,
             )
+
+            use_dynamic = (
+                max_atoms is not None
+                and hasattr(dataset, "get_atom_counts")
+                and getattr(dataset, "use_atom_level", False)
+            )
+            if use_dynamic:
+                atom_counts = dataset.get_atom_counts()
+                batch_sampler = DynamicBatchSampler(
+                    element_sampler=sequence_sampler,
+                    atom_counts=atom_counts,
+                    max_atoms_per_batch=max_atoms,
+                    drop_last=(dataset_type == "train"),
+                )
+                loader = DataLoader(
+                    dataset,
+                    batch_sampler=batch_sampler,
+                    collate_fn=collate_fn,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                )
+            else:
+                loader = DataLoader(
+                    dataset,
+                    batch_size=batch_size_for_type,
+                    shuffle=False,
+                    collate_fn=collate_fn,
+                    num_workers=num_workers,
+                    pin_memory=pin_memory,
+                    drop_last=(dataset_type == "train"),
+                    sampler=sequence_sampler,
+                )
             loaders[dataset_type].append(loader)
     return loaders

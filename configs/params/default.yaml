@@ -5,6 +5,7 @@
 TRAIN_BATCH_SIZE: 2 # 8 per GPU for V100 (64 if using 8 GPUs)
 VALIDATION_BATCH_SIZE: 2 # 32 per GPU for V100 (256 if using 8 GPUs)
 TEST_BATCH_SIZE: 8 # 32 per GPU for V100 (256 if using 8 GPUs)
+MAX_ATOMS_PER_BATCH: null  # null = fixed batch size; e.g. 20000 for dynamic batching
 
 # Sampling
 GRID_SAMPLER: false

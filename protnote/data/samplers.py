@@ -124,6 +124,44 @@ class DistributedWeightedSampler(Sampler):
         self.epoch = epoch
 
 
+class DynamicBatchSampler(BatchSampler):
+    """Groups indices into variable-size batches targeting a max atom budget.
+
+    A single protein always forms its own batch (never split), even if it
+    exceeds the budget. Wraps any existing element sampler (Distributed,
+    Weighted, etc.).
+    """
+
+    def __init__(self, element_sampler, atom_counts, max_atoms_per_batch, drop_last=False):
+        # Intentionally skip BatchSampler.__init__ — we manage state ourselves
+        self.element_sampler = element_sampler
+        self.atom_counts = atom_counts  # array indexed by dataset position
+        self.max_atoms_per_batch = max_atoms_per_batch
+        self.drop_last = drop_last
+
+    def __iter__(self):
+        batch, batch_atoms = [], 0
+        for idx in self.element_sampler:
+            n = self.atom_counts[idx]
+            if batch and batch_atoms + n > self.max_atoms_per_batch:
+                yield batch
+                batch, batch_atoms = [], 0
+            batch.append(idx)
+            batch_atoms += n
+        if batch and not self.drop_last:
+            yield batch
+
+    def __len__(self):
+        # Approximate: total atoms seen by this sampler / budget
+        total = sum(self.atom_counts[i] for i in range(len(self.atom_counts)))
+        ratio = len(self.element_sampler) / max(len(self.atom_counts), 1)
+        return max(1, int(total * ratio / self.max_atoms_per_batch))
+
+    def set_epoch(self, epoch):
+        if hasattr(self.element_sampler, "set_epoch"):
+            self.element_sampler.set_epoch(epoch)
+
+
 class GridBatchSampler(BatchSampler):
     def __init__(
         self,

@@ -960,7 +960,9 @@ class ProtNoteTrainer:
             self.epoch = epoch
 
             # Set distributed loader epoch to shuffle data
-            if hasattr(train_loader.sampler, "set_epoch"):
+            if hasattr(train_loader.batch_sampler, "set_epoch"):
+                train_loader.batch_sampler.set_epoch(epoch)
+            elif hasattr(train_loader.sampler, "set_epoch"):
                 train_loader.sampler.set_epoch(epoch)
 
             train_metrics = self.train_one_epoch(

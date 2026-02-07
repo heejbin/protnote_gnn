@@ -49,8 +49,8 @@ def consolidate_to_archive(
     entries = {}
     buffers = {}
 
-    for seq_id, filename in tqdm(graph_index.items(), desc="Reading .pt files"):
-        pt_path = graph_dir / filename
+    for seq_id, entry in tqdm(graph_index.items(), desc="Reading .pt files"):
+        pt_path = graph_dir / entry["filename"]
         if not pt_path.exists():
             logger.warning(f"Missing .pt file for {seq_id}: {pt_path}")
             continue
