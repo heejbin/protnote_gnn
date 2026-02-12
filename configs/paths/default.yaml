@@ -26,8 +26,6 @@ data_paths:
   #Other non-GO datasets to test zero shot
   VAL_EC_DATA_PATH_ZERO_SHOT: zero_shot/dev_EC.fasta
   TEST_EC_DATA_PATH_ZERO_SHOT: zero_shot/test_EC.fasta
-  FULL_EC_DATA_PATH: swissprot/proteinfer_splits/random/full_EC.fasta
-
   # Vocabulary paths
   VOCABULARIES_DIR: vocabularies/proteinfer
   GO_ANNOTATIONS_PATH: annotations/go_annotations_jul_2024.pkl
