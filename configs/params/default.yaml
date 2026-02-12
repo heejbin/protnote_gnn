@@ -50,6 +50,7 @@ NUM_EPOCHS: 46
 # Memory optimizations
 GRADIENT_ACCUMULATION_STEPS: 1 # 1 = no gradient accumulation
 GRADIENT_CHECKPOINTING: false # True = gradient checkpointing
+USE_AMP: true # Mixed precision (float16). Set false to avoid NaN with sequence encoder
 LORA: true # True = use LORA
 LORA_RANK: 4
 LORA_ALPHA: 8 # Typically = 2 * Rank
@@ -75,7 +76,7 @@ TRAIN_PROTEIN_ENCODER: true     # Whether to train the protein encoder
 
 # Legacy ProteInfer encoder settings (only used with --use-sequence-encoder flag)
 PRETRAINED_SEQUENCE_ENCODER: true
-TRAIN_SEQUENCE_ENCODER: true    # Whether to train ProteInfer encoder
+TRAIN_SEQUENCE_ENCODER: false  # Whether to train ProteInfer encoder
 LABEL_ENCODER_NUM_TRAINABLE_LAYERS: 0
 DISTRIBUTE_LABELS: false
 TRAIN_PROJECTION_HEAD: true
@@ -94,10 +95,11 @@ USE_RESIDUE_MASKING: false # If True, also use masking to augment sequences. Mus
 LABEL_AUGMENTATION_DESCRIPTIONS: name+label # Specifies what descriptions to use during training. # Options are any combination of label, name, and synonym_exact. Must include at least one.
 LABEL_EMBEDDING_NOISING_ALPHA: 20.0 # 0.0 = no noising. Typical ranges are <20. Noising scalar from https://arxiv.org/pdf/2310.05914.pdf
 
-# Interpretability (Phase 5): none = no interpretability loss; IntegratedGradient = IG + site ground truth MSE
+# Interpretability (Phase 5): none = no interpretability loss; IntegratedGradient = IG + site ground truth
 INTERPRETABILITY_METHOD: IntegratedGradient  # none | IntegratedGradient
-INTERPRETABILITY_WEIGHT: 0.1   # weight for interpretability loss (MSE between IG attribution and site-based target)
-INTERPRETABILITY_N_STEPS: 50   # number of steps for Integrated Gradients approximation
+INTERPRETABILITY_LOSS_TYPE: maximize  # mse = MSE(attribution, site target); maximize = maximize attribution on site atoms
+INTERPRETABILITY_WEIGHT: 0.1   # weight for interpretability loss
+INTERPRETABILITY_N_STEPS: 50   # number of steps for Integrated Gradients approximation (only for full IG)
 
 # Constants
 SEED: 42

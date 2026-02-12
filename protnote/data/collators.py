@@ -125,6 +125,7 @@ def _collate_atom_level(
     all_atom_types = []
     all_esmc_embeddings = []
     all_residue_indices = []
+    all_atom_to_residue = []
     all_edge_index = []
     all_atom_to_protein = []
     sequence_ids = []
@@ -146,6 +147,7 @@ def _collate_atom_level(
         else:
             esmc_emb_per_atom = esmc_emb
         all_esmc_embeddings.append(esmc_emb_per_atom)
+        all_atom_to_residue.append(atom_to_res)
 
         if "residue_indices" in item:
             all_residue_indices.append(item["residue_indices"])
@@ -168,6 +170,7 @@ def _collate_atom_level(
     batched_atom_types = torch.cat(all_atom_types, dim=0)
     batched_esmc_embeddings = torch.cat(all_esmc_embeddings, dim=0)
     batched_atom_to_protein = torch.cat(all_atom_to_protein, dim=0)
+    batched_atom_to_residue = torch.cat(all_atom_to_residue, dim=0)
 
     if any(e.numel() > 0 for e in all_edge_index):
         non_empty = [e for e in all_edge_index if e.numel() > 0]
@@ -186,6 +189,7 @@ def _collate_atom_level(
         "atom_types": batched_atom_types,
         "edge_index": batched_edge_index,
         "atom_to_protein": batched_atom_to_protein,
+        "atom_to_residue": batched_atom_to_residue,
         "num_proteins": len(batch),
     }
     if batched_residue_indices is not None:

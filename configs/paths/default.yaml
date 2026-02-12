@@ -62,6 +62,9 @@ data_paths:
   STRUCTURE_GRAPH_PKL: structure_graphs/combined_graph_plm.pkl  # sequence_id -> (x, plm, edge_index, edge_s)
   # Site ground truth for interpretability
   INTERPRETABILITY_SITE_TSV_PATH: annotations/uniprotkb_keyword_KW_0800_site.tsv
+  # Swiss-Prot .dat for functional residue sites (SITE, ACT_SITE, BINDING, etc.); used by maximize-attribution loss
+  INTERPRETABILITY_SITE_SWISSPROT_DAT_PATH: swissprot/uniprot_sprot_jul_2024.dat
+  INTERPRETABILITY_SITE_CACHE_PATH: annotations/site_from_swissprot.pkl
 
   # Atom-level structural pipeline (DEFAULT - used by hybrid ESM-C + EGNN encoder)
   # Run bin/prepare_graph_data.py to generate the graph archive
