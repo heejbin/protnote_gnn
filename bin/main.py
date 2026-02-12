@@ -53,15 +53,21 @@ def main(cfg: DictConfig):
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "8889"
 
-    mp.spawn(train_validate_test, nprocs=run.gpus, args=(cfg,))
+    # Single GPU: skip mp.spawn and DDP to avoid NCCL issues (e.g. GRID/vGPU)
+    if run.world_size == 1:
+        train_validate_test(0, cfg)
+    else:
+        mp.spawn(train_validate_test, nprocs=run.gpus, args=(cfg,))
 
 
 def train_validate_test(gpu, cfg):
     run = cfg.run
 
-    # Calculate GPU rank (based on node rank and GPU rank within the node) and initialize process group
+    # Calculate GPU rank (based on node rank and GPU rank within the node)
     rank = run.nr * run.gpus + gpu
-    dist.init_process_group(backend="nccl", init_method="env://", world_size=run.world_size, rank=rank)
+    use_ddp = run.world_size > 1
+    if use_ddp:
+        dist.init_process_group(backend="nccl", init_method="env://", world_size=run.world_size, rank=rank)
     print(
         f"{'=' * 50}\n"
         f"Initializing GPU {gpu}/{run.gpus - 1} on node {run.nr};\n"
@@ -340,11 +346,13 @@ def train_validate_test(gpu, cfg):
         temperature=config["params"]["SUPCON_TEMP"],
     )
 
-    # Wrap the model in DDP for distributed computing
-    if config["params"]["SYNC_BN"]:
-        model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
-
-    model = DDP(model.to(rank), device_ids=[rank], find_unused_parameters=True)
+    # Wrap the model in DDP for distributed computing (skip for single GPU to avoid NCCL issues)
+    if use_ddp:
+        if config["params"]["SYNC_BN"]:
+            model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        model = DDP(model.to(rank), device_ids=[rank], find_unused_parameters=True)
+    else:
+        model = model.to(device)
 
     # Calculate bce_pos_weight based on the training set
     if (params["BCE_POS_WEIGHT"] is None) & (run.train_path_name is not None):
@@ -405,7 +413,7 @@ def train_validate_test(gpu, cfg):
     )
 
     # Log the number of parameters by layer
-    count_parameters_by_layer(model.module)
+    count_parameters_by_layer(getattr(model, "module", model))
 
     # Load the model weights if --load-model argument is provided (using the DATA_PATH directory as the root)
     # TODO: Process model loading in the get_setup function
@@ -561,7 +569,8 @@ def train_validate_test(gpu, cfg):
         handler.close()
     # Torch
     torch.cuda.empty_cache()
-    dist.destroy_process_group()
+    if use_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

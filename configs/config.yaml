@@ -29,6 +29,7 @@ run:
   nodes: 1
   gpus: 1
   nr: 0
+  world_size: 1  # computed at runtime: gpus * nodes
 
 hydra:
   run:
