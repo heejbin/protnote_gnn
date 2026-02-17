@@ -1,107 +1,16 @@
 """
 Interpretability: Integrated Gradients and site-based ground truth for structural encoder.
 Phase 5 of proposal: align IG attribution with SwissProt Site annotations (MSE loss).
-Alternative: maximize attribution on functional residues (from Swiss-Prot .dat).
 """
-import os
 import re
-from typing import Dict, List, Optional, Set, Tuple
-
-import pandas as pd
 import torch
+import pandas as pd
+from typing import Dict, List, Optional, Tuple
 
 try:
     import torch_scatter
 except ImportError:
     torch_scatter = None
-
-# Feature keys that denote functional residue sites (UniProt FT table)
-DEFAULT_SITE_FEATURE_KEYS = frozenset(
-    {"SITE", "ACT_SITE", "BINDING", "METAL", "DISULFID", "LIPID", "CARBOHYD", "MOD_RES"}
-)
-
-
-def load_site_from_swissprot_dat(
-    dat_path: str,
-    feature_keys: Optional[Set[str]] = None,
-    cache_path: Optional[str] = None,
-) -> Dict[str, List[int]]:
-    """
-    Load functional residue positions from UniProt/Swiss-Prot .dat file.
-
-    Extracts FT (feature) lines for SITE, ACT_SITE, BINDING, METAL, etc.
-    Returns: dict[Entry] -> list of 1-based residue positions (unique, sorted).
-
-    feature_keys: Set of FT keys to include (default: SITE, ACT_SITE, BINDING, METAL, ...).
-    cache_path: If set, save/load pickled dict for faster reuse.
-    """
-    from Bio import SwissProt
-
-    if feature_keys is None:
-        feature_keys = DEFAULT_SITE_FEATURE_KEYS
-
-    if cache_path and os.path.isfile(cache_path):
-        import pickle
-        with open(cache_path, "rb") as f:
-            return pickle.load(f)
-
-    out: Dict[str, List[int]] = {}
-    dat_path = os.path.expanduser(dat_path)
-    if not os.path.isfile(dat_path):
-        return out
-
-    with open(dat_path, "r") as f:
-        for record in SwissProt.parse(f):
-            acc = record.accessions[0] if record.accessions else None
-            if not acc:
-                continue
-            positions: set = set()
-            for feat in getattr(record, "features", []) or []:
-                # Support both tuple (key, from, to, desc) and FeatureTable objects
-                try:
-                    if hasattr(feat, "type"):
-                        key = (feat.type or "").strip().upper()
-                        if key not in feature_keys:
-                            continue
-                        loc = getattr(feat, "location", None)
-                        if loc is None:
-                            continue
-                        start = getattr(loc, "start", None)
-                        end = getattr(loc, "end", None)
-                        if start is not None and isinstance(start, int):
-                            start_1based = start + 1
-                            if end is not None and isinstance(end, int):
-                                for p in range(start_1based, end + 1):
-                                    positions.add(p)
-                            else:
-                                positions.add(start_1based)
-                        elif end is not None and isinstance(end, int):
-                            positions.add(end + 1)
-                    else:
-                        if len(feat) < 3:
-                            continue
-                        key = (feat[0] or "").strip().upper()
-                        if key not in feature_keys:
-                            continue
-                        start, end = feat[1], feat[2]
-                        if isinstance(start, int) and isinstance(end, int):
-                            for p in range(start, end + 1):
-                                positions.add(p)
-                        elif isinstance(start, int):
-                            positions.add(start)
-                        elif isinstance(end, int):
-                            positions.add(end)
-                except (TypeError, ValueError, AttributeError):
-                    continue
-            out[acc] = sorted(positions)
-
-    if cache_path:
-        os.makedirs(os.path.dirname(cache_path) or ".", exist_ok=True)
-        import pickle
-        with open(cache_path, "wb") as f:
-            pickle.dump(out, f)
-
-    return out
 
 
 def load_site_ground_truth_tsv(tsv_path: str) -> Dict[str, List[int]]:
@@ -209,43 +118,6 @@ def integrated_gradients_node_attribution(
     return node_attr
 
 
-def gradient_input_atom_attribution_from_logits(
-    logits: torch.Tensor,
-    node_features: torch.Tensor,
-    atom_to_protein: torch.Tensor,
-    device: torch.device = None,
-    baseline: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """
-    Differentiable attribution for atom-level graph: (x - baseline) * grad(logit sum, x).
-    node_features: [N_atoms, feat_dim] with requires_grad=True (e.g. esmc_embeddings).
-    atom_to_protein: [N_atoms] batch index per atom.
-    Returns per-atom attribution (num_atoms,) summing to 1 per protein (normalized).
-    """
-    if device is None:
-        device = logits.device
-    x = node_features
-    if baseline is None:
-        baseline = torch.zeros_like(x, device=x.device, dtype=x.dtype)
-    scalar = logits.sum()
-    (grad_x,) = torch.autograd.grad(scalar, x, retain_graph=True, allow_unused=True)
-    if grad_x is None:
-        attr = torch.zeros(x.shape[0], device=device, dtype=x.dtype)
-    else:
-        attr = (x - baseline).detach() * grad_x
-    attr = attr.sum(dim=-1)
-    if torch_scatter is not None:
-        batch_idx = atom_to_protein.to(device)
-        sums = torch_scatter.scatter_add(attr, batch_idx, dim=0)
-        sums = sums[batch_idx].clamp(min=1e-8)
-        attr = attr / sums
-    else:
-        s = attr.sum()
-        if s > 1e-8:
-            attr = attr / s
-    return attr
-
-
 def gradient_input_node_attribution_from_logits(
     logits: torch.Tensor,
     structure_batch,
@@ -331,74 +203,6 @@ def interpretability_loss_mse(
             node_attr_scaled = node_attr_g
         count += 1
         losses.append(((node_attr_scaled - target) ** 2).mean())
-    if not losses:
-        return torch.tensor(0.0, device=device), 0
-    return torch.stack(losses).mean(), count
-
-
-def interpretability_loss_maximize_site_attribution(
-    atom_attribution: torch.Tensor,
-    atom_to_protein: torch.Tensor,
-    atom_to_residue: torch.Tensor,
-    sequence_ids: List[str],
-    site_dict: Dict[str, List[int]],
-    device: torch.device,
-    normalize_per_protein: bool = True,
-) -> Tuple[torch.Tensor, int]:
-    """
-    Maximize IG attribution on atoms belonging to functional site residues.
-
-    Loss = -mean(sum of attribution on site atoms per protein).
-    Minimizing this loss maximizes the attribution on functional residues.
-
-    atom_attribution: (num_atoms,) per-atom importance (e.g. from gradient*input).
-    atom_to_protein: (num_atoms,) batch index for each atom.
-    atom_to_residue: (num_atoms,) 0-based residue index for each atom.
-    sequence_ids: list of Entry IDs per protein in batch.
-    site_dict: Entry -> list of 1-based residue positions from Swiss-Prot.
-    normalize_per_protein: If True, divide by total attr per protein before summing (focus on fraction on sites).
-    Returns: (loss, count of proteins with non-empty sites used).
-    """
-    if torch_scatter is None:
-        return torch.tensor(0.0, device=device), 0
-
-    unique_batch = atom_to_protein.unique(sorted=True)
-    losses = []
-    count = 0
-
-    for b in unique_batch:
-        bi = int(b)
-        mask = atom_to_protein == b
-        attr_g = atom_attribution[mask]
-        res_g = atom_to_residue[mask]  # 0-based
-
-        sid = sequence_ids[bi] if bi < len(sequence_ids) else None
-        if sid is None:
-            continue
-        sites_1based = site_dict.get(sid, [])
-        if not sites_1based:
-            continue
-
-        # 1-based -> 0-based
-        sites_0based = [p - 1 for p in sites_1based if p >= 1]
-        if not sites_0based:
-            continue
-        sites_t = torch.tensor(sites_0based, device=res_g.device, dtype=res_g.dtype)
-        site_atom_mask = (res_g.unsqueeze(1) == sites_t).any(dim=1)
-        if not site_atom_mask.any():
-            continue
-
-        sum_on_sites = attr_g[site_atom_mask].sum()
-        if normalize_per_protein:
-            total = attr_g.sum().clamp(min=1e-8)
-            term = sum_on_sites / total
-        else:
-            term = sum_on_sites
-
-        # Maximize term -> minimize -term
-        losses.append(-term)
-        count += 1
-
     if not losses:
         return torch.tensor(0.0, device=device), 0
     return torch.stack(losses).mean(), count

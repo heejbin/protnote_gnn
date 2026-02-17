@@ -24,18 +24,14 @@ import pickle
 import shutil
 import json
 from collections import defaultdict
-from contextlib import nullcontext
 from torch.cuda.amp import autocast, GradScaler
 from torch.nn.utils import clip_grad_norm_
 from transformers import BatchEncoding
 from protnote.utils.models import biogpt_train_last_n_layers, save_checkpoint, load_model
 from protnote.utils.interpretability import (
     load_site_ground_truth_tsv,
-    load_site_from_swissprot_dat,
     gradient_input_node_attribution_from_logits,
-    gradient_input_atom_attribution_from_logits,
     interpretability_loss_mse,
-    interpretability_loss_maximize_site_attribution,
 )
 from torcheval.metrics import (
     MultilabelAUPRC,
@@ -140,38 +136,19 @@ class ProtNoteTrainer:
         self.train_sequence_encoder = config["params"]["TRAIN_SEQUENCE_ENCODER"]
         self.use_structural_encoder = config["params"].get("USE_STRUCTURAL_ENCODER", False)
         self.interpretability_method = (config["params"].get("INTERPRETABILITY_METHOD", "none") or "none").strip().lower()
-        self.interpretability_loss_type = (config["params"].get("INTERPRETABILITY_LOSS_TYPE", "mse") or "mse").strip().lower()
         self.interpretability_weight = config["params"].get("INTERPRETABILITY_WEIGHT", 0.1)
         self.interpretability_n_steps = config["params"].get("INTERPRETABILITY_N_STEPS", 50)
         self._site_ground_truth = None
         if self.interpretability_method == "integratedgradient" and self.use_structural_encoder:
-            if self.interpretability_loss_type == "maximize":
-                dat_path = config["paths"].get("INTERPRETABILITY_SITE_SWISSPROT_DAT_PATH")
-                cache_path = config["paths"].get("INTERPRETABILITY_SITE_CACHE_PATH")
-                if dat_path and os.path.isfile(dat_path):
-                    self._site_ground_truth = load_site_from_swissprot_dat(
-                        dat_path, cache_path=cache_path
-                    )
-                    self.logger.info(
-                        f"Interpretability (maximize): loaded site from Swiss-Prot .dat for {len(self._site_ground_truth)} entries"
-                    )
-                else:
-                    self.logger.warning(
-                        "INTERPRETABILITY_LOSS_TYPE=maximize but INTERPRETABILITY_SITE_SWISSPROT_DAT_PATH missing or not a file; interpretability loss disabled."
-                    )
-                    self._site_ground_truth = {}
+            tsv_path = config["paths"].get("INTERPRETABILITY_SITE_TSV_PATH")
+            if tsv_path and os.path.isfile(tsv_path):
+                self._site_ground_truth = load_site_ground_truth_tsv(tsv_path)
+                self.logger.info(f"Interpretability: loaded site ground truth for {len(self._site_ground_truth)} entries from {tsv_path}")
             else:
-                tsv_path = config["paths"].get("INTERPRETABILITY_SITE_TSV_PATH")
-                if tsv_path and os.path.isfile(tsv_path):
-                    self._site_ground_truth = load_site_ground_truth_tsv(tsv_path)
-                    self.logger.info(
-                        f"Interpretability (mse): loaded site ground truth for {len(self._site_ground_truth)} entries from {tsv_path}"
-                    )
-                else:
-                    self.logger.warning(
-                        "INTERPRETABILITY_METHOD=IntegratedGradient but INTERPRETABILITY_SITE_TSV_PATH missing or not a file; interpretability loss disabled."
-                    )
-                    self._site_ground_truth = {}
+                self.logger.warning(
+                    "INTERPRETABILITY_METHOD=IntegratedGradient but INTERPRETABILITY_SITE_TSV_PATH missing or not a file; interpretability loss disabled."
+                )
+                self._site_ground_truth = {}
         self.label_encoder_num_trainable_layers = config["params"][
             "LABEL_ENCODER_NUM_TRAINABLE_LAYERS"
         ]
@@ -200,9 +177,7 @@ class ProtNoteTrainer:
             opt_name=config["params"]["OPTIMIZER"], lr=config["params"]["LEARNING_RATE"]
         )
 
-        self.use_amp = config["params"].get("USE_AMP", True)
-        self.scaler = GradScaler() if self.use_amp else None
-        self._amp_context = autocast if self.use_amp else nullcontext
+        self.scaler = GradScaler()
         self.base_model_path = self._get_saved_model_base_path()
         self.model_path_best_metric = self.base_model_path + f"_best_val_metric.pt"
         self.model_path_best_loss = self.base_model_path + f"_best_val_loss.pt"
@@ -355,7 +330,7 @@ class ProtNoteTrainer:
             }
 
         # Forward pass
-        with self._amp_context():
+        with autocast():
             logits, embeddings = self.model(**inputs, save_embeddings=return_embeddings)
             loss = self.loss_fn(logits, label_multihots.float())
 
@@ -407,7 +382,7 @@ class ProtNoteTrainer:
             self.best_val_metric = val_metrics[val_optimization_metric_name]
 
             save_checkpoint(
-                model=self._get_model(),
+                model=self.model.module,
                 optimizer=self.optimizer,
                 epoch=self.epoch,
                 best_val_metric=self.best_val_metric,
@@ -428,7 +403,7 @@ class ProtNoteTrainer:
             self.best_val_loss = val_metrics[f"{prefix}_loss"]
 
             save_checkpoint(
-                model=self._get_model(),
+                model=self.model.module,
                 optimizer=self.optimizer,
                 epoch=self.epoch,
                 best_val_metric=self.best_val_loss,
@@ -703,11 +678,10 @@ class ProtNoteTrainer:
                         save_as_h5=True
                     )
 
-            # Aggregate the TP, FN, FP across all GPUs (skip if not using DDP)
-            if dist.is_initialized():
-                dist.reduce(total_tp_per_label, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(total_fn_per_label, dst=0, op=dist.ReduceOp.SUM)
-                dist.reduce(total_fp_per_label, dst=0, op=dist.ReduceOp.SUM)
+            # Aggregate the TP, FN, FP across all GPUs
+            dist.reduce(total_tp_per_label, dst=0, op=dist.ReduceOp.SUM)
+            dist.reduce(total_fn_per_label, dst=0, op=dist.ReduceOp.SUM)
+            dist.reduce(total_fp_per_label, dst=0, op=dist.ReduceOp.SUM)
 
             global_f1_scores_per_label = calculate_f1(
                 tp=total_tp_per_label, fn=total_fn_per_label, fp=total_fp_per_label
@@ -767,9 +741,6 @@ class ProtNoteTrainer:
                 label_token_counts = batch["label_token_counts"]
                 # Move graph_data tensors to device
                 graph_data = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in graph_data.items()}
-                if self._site_ground_truth and self.interpretability_method == "integratedgradient":
-                    if "esmc_embeddings" in graph_data:
-                        graph_data["esmc_embeddings"].requires_grad_(True)
                 label_multihots, label_embeddings, label_token_counts = self._to_device(
                     label_multihots, label_embeddings, label_token_counts
                 )
@@ -778,7 +749,6 @@ class ProtNoteTrainer:
                     "label_embeddings": label_embeddings,
                     "label_token_counts": label_token_counts,
                 }
-                structure_batch = None
             elif self.use_structural_encoder:
                 structure_batch = batch["structure_batch"]
                 sequence_ids = batch.get("sequence_ids", [])
@@ -828,11 +798,9 @@ class ProtNoteTrainer:
                     "label_embeddings": label_embeddings,
                     "label_token_counts": label_token_counts,
                 }
-                structure_batch = None
-                graph_data = None
 
             # Forward pass
-            with self._amp_context():
+            with autocast():
                 logits, _ = self.model(**inputs)
 
                 # Compute loss, normalized by the number of gradient accumulation steps
@@ -841,69 +809,36 @@ class ProtNoteTrainer:
                     / self.gradient_accumulation_steps
                 )
 
-                # Interpretability loss
-                if self._site_ground_truth and self.interpretability_method == "integratedgradient":
-                    interp_loss = None
-                    if graph_data is not None and "esmc_embeddings" in graph_data and graph_data["esmc_embeddings"].requires_grad:
-                        # Atom-level: gradient*input on esmc_embeddings, maximize attribution on site atoms
-                        atom_attr = gradient_input_atom_attribution_from_logits(
-                            logits,
-                            graph_data["esmc_embeddings"],
-                            graph_data["atom_to_protein"],
-                            device=self.device,
-                        )
-                        interp_loss, _ = interpretability_loss_maximize_site_attribution(
-                            atom_attr,
-                            graph_data["atom_to_protein"],
-                            graph_data["atom_to_residue"],
-                            sequence_ids,
-                            self._site_ground_truth,
-                            self.device,
-                            normalize_per_protein=True,
-                        )
-                    elif structure_batch is not None and getattr(structure_batch, "plm", None) is not None and structure_batch.plm.requires_grad:
-                        node_attr = gradient_input_node_attribution_from_logits(
-                            logits, structure_batch, baseline_plm=None, device=self.device
-                        )
-                        if self.interpretability_loss_type == "maximize":
-                            # Residue-level: nodes = residues, build residue indices from batch
-                            batch_idx = structure_batch.batch
-                            try:
-                                import torch_scatter
-                                ones = torch.ones_like(batch_idx, dtype=torch.long, device=batch_idx.device)
-                                counts = torch_scatter.scatter_add(ones, batch_idx, dim=0)
-                                ptr = torch.cat([torch.zeros(1, device=batch_idx.device, dtype=torch.long), counts.cumsum(0)[:-1]])
-                                residue_idx = torch.arange(len(batch_idx), device=batch_idx.device, dtype=torch.long) - ptr[batch_idx]
-                                interp_loss, _ = interpretability_loss_maximize_site_attribution(
-                                    node_attr, batch_idx, residue_idx,
-                                    sequence_ids, self._site_ground_truth, self.device, normalize_per_protein=True,
-                                )
-                            except ImportError:
-                                interp_loss = None
-                        else:
-                            interp_loss, _ = interpretability_loss_mse(
-                                node_attr,
-                                structure_batch.batch,
-                                sequence_ids,
-                                self._site_ground_truth,
-                                self.device,
-                                logits_per_sample=logits.sum(dim=1),
-                            )
-                    if interp_loss is not None:
-                        loss = loss + self.interpretability_weight * interp_loss
+                # Interpretability loss (IntegratedGradient): MSE between gradient-input attribution and site ground truth
+                if (
+                    self.use_structural_encoder
+                    and self._site_ground_truth is not None
+                    and self.interpretability_method == "integratedgradient"
+                    and getattr(structure_batch, "plm", None) is not None
+                    and structure_batch.plm.requires_grad
+                ):
+                    node_attr = gradient_input_node_attribution_from_logits(
+                        logits, structure_batch, baseline_plm=None, device=self.device
+                    )
+                    interp_loss, _ = interpretability_loss_mse(
+                        node_attr,
+                        structure_batch.batch,
+                        sequence_ids,
+                        self._site_ground_truth,
+                        self.device,
+                        logits_per_sample=logits.sum(dim=1),
+                    )
+                    loss = loss + self.interpretability_weight * interp_loss
 
-            # Backward pass
-            if self.use_amp:
-                self.scaler.scale(loss).backward()
-            else:
-                loss.backward()
+            # Backward pass with mixed precision
+            self.scaler.scale(loss).backward()
 
             # Gradient accumulation every GRADIENT_ACCUMULATION_STEPS
             if (self.training_step % self.gradient_accumulation_steps == 0) or (
                 batch_idx + 1 == len(train_loader)
             ):
-                if self.use_amp:
-                    self.scaler.unscale_(self.optimizer)
+                # Unscales the gradients of optimizer's assigned params in-place
+                self.scaler.unscale_(self.optimizer)
 
                 # Apply gradient clipping
                 if self.clip_value is not None:
@@ -911,11 +846,8 @@ class ProtNoteTrainer:
                         self._get_model().parameters(), max_norm=self.clip_value
                     )
 
-                if self.use_amp:
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    self.optimizer.step()
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
                 self.optimizer.zero_grad()
 
             avg_loss.update(loss.detach())
@@ -955,11 +887,10 @@ class ProtNoteTrainer:
                     f"[Train] Epoch {self.epoch}: Processed {batch_idx} out of {len(train_loader)} batches ({batch_idx / len(train_loader) * 100:.2f}%)."
                 )
 
-        # Aggregate the TP, FN, FP across all GPUs (skip if not using DDP)
-        if dist.is_initialized():
-            dist.reduce(total_tp_per_label, dst=0, op=dist.ReduceOp.SUM)
-            dist.reduce(total_fn_per_label, dst=0, op=dist.ReduceOp.SUM)
-            dist.reduce(total_fp_per_label, dst=0, op=dist.ReduceOp.SUM)
+        # Aggregate the TP, FN, FP across all GPUs
+        dist.reduce(total_tp_per_label, dst=0, op=dist.ReduceOp.SUM)
+        dist.reduce(total_fn_per_label, dst=0, op=dist.ReduceOp.SUM)
+        dist.reduce(total_fp_per_label, dst=0, op=dist.ReduceOp.SUM)
 
         global_f1_scores_per_label = calculate_f1(
             tp=total_tp_per_label, fn=total_fn_per_label, fp=total_fp_per_label
@@ -1057,7 +988,7 @@ class ProtNoteTrainer:
                 if epoch == self.starting_epoch + self.num_epochs - 1:
                     self.logger.info("Saving model from last epoch...")
                     save_checkpoint(
-                        model=self._get_model(),
+                        model=self.model.module,
                         optimizer=self.optimizer,
                         epoch=self.epoch,
                         best_val_metric=self.best_val_metric,
@@ -1072,7 +1003,7 @@ class ProtNoteTrainer:
                     self.logger.info(f"Saving checkpoint from epoch {epoch}...")
                     epoch_model_path = self.base_model_path + f"_epoch_{epoch}.pt"
                     save_checkpoint(
-                        model=self._get_model(),
+                        model=self.model.module,
                         optimizer=self.optimizer,
                         epoch=self.epoch,
                         best_val_metric=self.best_val_metric,
@@ -1093,13 +1024,13 @@ class ProtNoteTrainer:
                 checkpoint_path=self.model_path_best_metric,
             )
 
-        # Broadcast model state to other processes (only when DDP is used)
-        if torch.distributed.is_initialized():
-            if self.is_master:
-                for param in self._get_model().parameters():
-                    torch.distributed.broadcast(param.data, src=0)
-            else:
-                for param in self._get_model().parameters():
-                    torch.distributed.broadcast(param.data, src=0)
+            # Broadcast model state to other processes
+            for param in self._get_model().parameters():
+                # src=0 means source is the master process
+                torch.distributed.broadcast(param.data, src=0)
+        else:
+            # For non-master processes, just receive the broadcasted data
+            for param in self._get_model().parameters():
+                torch.distributed.broadcast(param.data, src=0)
 
         # self.tb.close()
