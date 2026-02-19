@@ -440,6 +440,8 @@ class ProtNoteTrainer:
 
         best_th = 0.0
         best_score = 0.0
+        all_probabilities = []
+        all_label_multihots = []
 
         with torch.no_grad():
             for batch in data_loader:
@@ -452,6 +454,9 @@ class ProtNoteTrainer:
 
                 if self.normalize_probabilities:
                     probabilities = self._normalize_probabilities(probabilities)
+
+                all_probabilities.append(probabilities)
+                all_label_multihots.append(label_multihots)
 
             all_probabilities = torch.cat(all_probabilities)
             all_label_multihots = torch.cat(all_label_multihots)

@@ -102,13 +102,16 @@ def _build_dataset_paths(paths: dict, run) -> dict:
     test_paths_names = run.test_paths_names
     annotations_path_name = run.annotations_path_name
 
+    # Normalize test_paths_names to a list (config may provide a single string)
+    if isinstance(test_paths_names, str):
+        test_paths_names = [test_paths_names]
+
     train_paths_list = (
         [
             {
                 "data_path": paths[train_path_name],
                 "dataset_type": "train",
                 "annotations_path": paths[annotations_path_name],
-                "vocabularies_dir": paths["VOCABULARIES_DIR"],
             }
         ]
         if train_path_name is not None
@@ -121,7 +124,6 @@ def _build_dataset_paths(paths: dict, run) -> dict:
                 "data_path": paths[val_path_name],
                 "dataset_type": "validation",
                 "annotations_path": paths[annotations_path_name],
-                "vocabularies_dir": paths["VOCABULARIES_DIR"],
             }
         ]
         if val_path_name is not None
@@ -134,7 +136,6 @@ def _build_dataset_paths(paths: dict, run) -> dict:
                 "data_path": paths[key],
                 "dataset_type": "test",
                 "annotations_path": paths[annotations_path_name],
-                "vocabularies_dir": paths["VOCABULARIES_DIR"],
             }
             for key in test_paths_names
         ]

@@ -46,26 +46,26 @@ def main(cfg: DictConfig):
     # TODO: If running with multiple GPUs, make sure the vocabularies and embeddings have been pre-generated (otherwise, it will be generated multiple times)
 
     # Distributed computing
-    run.world_size = run.gpus * run.nodes
+    world_size = run.gpus * run.nodes
     if run.amlt:
         run.nr = int(os.environ["NODE_RANK"])
     else:
         os.environ["MASTER_ADDR"] = "localhost"
         os.environ["MASTER_PORT"] = "8889"
 
-    mp.spawn(train_validate_test, nprocs=run.gpus, args=(cfg,))
+    mp.spawn(train_validate_test, nprocs=run.gpus, args=(cfg, world_size))
 
 
-def train_validate_test(gpu, cfg):
+def train_validate_test(gpu, cfg, world_size):
     run = cfg.run
 
     # Calculate GPU rank (based on node rank and GPU rank within the node) and initialize process group
     rank = run.nr * run.gpus + gpu
-    dist.init_process_group(backend="nccl", init_method="env://", world_size=run.world_size, rank=rank)
+    dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
     print(
         f"{'=' * 50}\n"
         f"Initializing GPU {gpu}/{run.gpus - 1} on node {run.nr};\n"
-        f"    or, gpu {rank + 1}/{run.world_size} for all nodes.\n"
+        f"    or, gpu {rank + 1}/{world_size} for all nodes.\n"
         f"{'=' * 50}"
     )
 
@@ -100,11 +100,14 @@ def train_validate_test(gpu, cfg):
         wandb.init(
             project=run.wandb_project,
             name=f"{run.name}_{timestamp}",
-            config=OmegaConf.to_container(params, resolve=True) | dict(
-                name=run.name, amlt=run.amlt, model_file=run.model_file,
+            config=OmegaConf.to_container(params, resolve=True)
+            | dict(
+                name=run.name,
+                amlt=run.amlt,
+                model_file=run.model_file,
             ),
             sync_tensorboard=False,
-            entity="hinagi",
+            entity=run.wandb_entity,
         )
 
         if run.amlt & run.mlflow:
@@ -246,7 +249,7 @@ def train_validate_test(gpu, cfg):
             shuffle_labels=params["SHUFFLE_LABELS"],
             in_batch_sampling=params["IN_BATCH_SAMPLING"],
             num_workers=params["NUM_WORKERS"],
-            world_size=run.world_size,
+            world_size=world_size,
             rank=rank,
             sequence_weights=sequence_weights,
         )
@@ -259,7 +262,7 @@ def train_validate_test(gpu, cfg):
             in_batch_sampling=params["IN_BATCH_SAMPLING"],
             grid_sampler=params["GRID_SAMPLER"],
             num_workers=params["NUM_WORKERS"],
-            world_size=run.world_size,
+            world_size=world_size,
             rank=rank,
             sequence_weights=sequence_weights,
         )
