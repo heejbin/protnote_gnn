@@ -172,9 +172,9 @@ class ProteinStructureDataset(Dataset):
     def _get_archive_reader(self):
         """Lazily initialize the archive reader on first access."""
         if self._archive_reader is None and hasattr(self, "graph_archive_path") and self.graph_archive_path:
-            from protnote.utils.graph_archive import GraphArchiveReader
+            from protnote.utils.graph_archive import open_archive
 
-            self._archive_reader = GraphArchiveReader(self.graph_archive_path)
+            self._archive_reader = open_archive(self.graph_archive_path)
         return self._archive_reader
 
     def _load_graph_atom_level(self, sequence_id, sequence):

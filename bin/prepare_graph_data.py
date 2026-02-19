@@ -4,7 +4,7 @@ Reads parsed structures and pre-computed ESM-C embeddings, builds atom-level
 graphs with combined covalent + k-NN edges, and saves final tensors.
 
 Supports multiprocessing for parallel graph construction and optional
-consolidation into a single indexed archive file (.tngrph).
+consolidation into a single indexed archive file (.pngrph).
 
 Example Usage:
     python bin/prepare_graph_data.py \
@@ -27,7 +27,11 @@ from tqdm import tqdm
 
 from protnote.utils.configs import get_project_root, register_resolvers
 from protnote.utils.data import read_fasta
-from protnote.utils.graph_archive import consolidate_to_archive
+from protnote.utils.graph_archive import (
+    consolidate_to_archive,
+    consolidate_to_sharded_archive,
+    open_archive,
+)
 from protnote.utils.structure import extract_aa_residue_by_chain_ids
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
@@ -201,6 +205,13 @@ def main():
         action="store_true",
         default=False,
         help="Skip consolidation into a single archive file.",
+    )
+    parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Number of archive shards (default: 1 = single file). "
+        "Set to e.g. 16 for large datasets.",
     )
     parser.add_argument(
         "--keep-individual-files",
@@ -390,9 +401,14 @@ def main():
 
     # --- Consolidation ---
     if not args.no_consolidate and graph_index:
-        archive_path = output_dir / "graphs.pngrph"
-        logger.info(f"Consolidating {len(graph_index)} graphs into {archive_path}")
-        n_archived = consolidate_to_archive(output_dir, graph_index, archive_path)
+        num_shards = args.num_shards
+        if num_shards > 1:
+            logger.info(f"Consolidating {len(graph_index)} graphs into {num_shards} shards in {output_dir}")
+            n_archived = consolidate_to_sharded_archive(output_dir, graph_index, output_dir, num_shards)
+        else:
+            archive_path = output_dir / "graphs.pngrph"
+            logger.info(f"Consolidating {len(graph_index)} graphs into {archive_path}")
+            n_archived = consolidate_to_archive(output_dir, graph_index, archive_path)
 
         if n_archived > 0 and not args.keep_individual_files:
             logger.info("Removing individual .pt files...")
@@ -406,13 +422,13 @@ def main():
 
     # Print summary
     if graph_index:
-        # Try loading from archive first, then individual file
-        archive_path = output_dir / "graphs.pngrph"
         sample_id = next(iter(graph_index))
-        if archive_path.exists():
-            from protnote.utils.graph_archive import GraphArchiveReader
-
-            reader = GraphArchiveReader(archive_path)
+        # Try loading from archive (single or sharded), then individual file
+        archive_path = output_dir / "graphs.pngrph"
+        shard_files = list(output_dir.glob("graphs.shard-*-of-*.pngrph"))
+        if archive_path.exists() or shard_files:
+            archive_source = archive_path if archive_path.exists() else output_dir
+            reader = open_archive(archive_source)
             sample = reader[sample_id]
             reader.close()
         else:

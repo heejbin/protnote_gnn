@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 
 import hydra
 import torch
@@ -151,11 +152,16 @@ def train_validate_test(gpu, cfg, world_size):
         else:
             logger.warning(f"Graph index not found at {graph_index_path}. Structure data will use fallbacks.")
 
-        # Detect archive file
+        # Detect archive file (single .pngrph or sharded directory)
         graph_archive_path = paths.get("GRAPH_ARCHIVE_PATH", "")
         if not graph_archive_path or not os.path.exists(graph_archive_path):
             default_archive = os.path.join(graph_dir, "graphs.pngrph") if graph_dir else ""
-            graph_archive_path = default_archive if os.path.exists(default_archive) else None
+            if default_archive and os.path.exists(default_archive):
+                graph_archive_path = default_archive
+            elif graph_dir and any(Path(graph_dir).glob("graphs.shard-*-of-*.pngrph")):
+                graph_archive_path = graph_dir  # open_archive() handles directory
+            else:
+                graph_archive_path = None
         if graph_archive_path:
             logger.info(f"Using graph archive: {graph_archive_path}")
 
