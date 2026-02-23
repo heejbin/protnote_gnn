@@ -20,6 +20,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import signal
 from pathlib import Path
 
 import torch
@@ -59,7 +60,15 @@ def collect_sequences_map(fasta_paths: list[Path]) -> dict[str, str]:
 _worker_ctx = {}
 
 
-def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_map, knn_k, local_afdb_dir=None, local_afdb_suffix=None):
+class _ProcessingTimeout(Exception):
+    """Raised by SIGALRM when a single protein exceeds the time limit."""
+
+
+def _sigalrm_handler(signum, frame):
+    raise _ProcessingTimeout
+
+
+def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_map, knn_k, local_afdb_dir=None, local_afdb_suffix=None, timeout=0):
     """Called once per worker process to store shared config and import heavy modules."""
     _worker_ctx["structure_dir"] = Path(structure_dir)
     _worker_ctx["esmc_dir"] = Path(esmc_dir)
@@ -69,6 +78,10 @@ def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_
     _worker_ctx["knn_k"] = knn_k
     _worker_ctx["local_afdb_dir"] = Path(local_afdb_dir) if local_afdb_dir else None
     _worker_ctx["local_afdb_suffix"] = local_afdb_suffix
+    _worker_ctx["timeout"] = timeout
+
+    if timeout > 0:
+        signal.signal(signal.SIGALRM, _sigalrm_handler)
 
     # Import heavy modules once per worker (avoid repeated import overhead)
     from protnote.utils.structure import (
@@ -93,7 +106,11 @@ def _process_one(seq_id: str) -> dict:
         or {"seq_id": str, "status": "failed", "reason": str}
     """
     ctx = _worker_ctx
+    timeout = ctx.get("timeout", 0)
     try:
+        if timeout > 0:
+            signal.alarm(timeout)
+
         struct_info = ctx["structure_index"][seq_id]
 
         # Resolve structure file path: use local AFDB folder for alphafolddb entries if configured
@@ -170,8 +187,13 @@ def _process_one(seq_id: str) -> dict:
             "data_bytes": buf.getvalue(),
         }
 
+    except _ProcessingTimeout:
+        return {"seq_id": seq_id, "status": "failed", "reason": f"timeout (>{timeout}s)"}
     except Exception as e:
         return {"seq_id": seq_id, "status": "failed", "reason": str(e)}
+    finally:
+        if timeout > 0:
+            signal.alarm(0)
 
 
 def main():
@@ -218,6 +240,14 @@ def main():
         action="store_true",
         default=False,
         help="Keep individual .pt files after archiving (default: delete them).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Per-protein timeout in seconds (default: 300). "
+        "Proteins exceeding this are marked failed and retried on the next run. "
+        "Set to 0 to disable.",
     )
     parser.add_argument(
         "--local-afdb",
@@ -334,6 +364,7 @@ def main():
                     knn_k,
                     str(local_afdb_dir) if local_afdb_dir else None,
                     local_afdb_suffix,
+                    args.timeout,
                 ),
             ) as pool:
                 results = pool.imap_unordered(_process_one, remaining, chunksize=args.chunksize)
@@ -367,6 +398,7 @@ def main():
                 knn_k,
                 str(local_afdb_dir) if local_afdb_dir else None,
                 local_afdb_suffix,
+                args.timeout,
             )
             for seq_id in tqdm(remaining, desc="Preparing graph data"):
                 result = _process_one(seq_id)
