@@ -1,12 +1,12 @@
 # Paths referenced relative to DATA_PATH (will have "data" prepended)
 data_paths:
   # ProteInfer data paths
-  TRAIN_DATA_PATH: sequences/uniprot_sprot_2025_01/splits/train_GO.fasta
-  VAL_DATA_PATH: sequences/uniprot_sprot_2025_01/splits/dev_GO.fasta
-  TEST_DATA_PATH: sequences/uniprot_sprot_2025_01/splits/test_GO.fasta
-  TEST_TOP_LABELS_DATA_PATH: sequences/uniprot_sprot_2025_01/splits/test_top_labels_GO.fasta
+  TRAIN_DATA_PATH: sequences/uniprot_sprot_2025_01_with_struct/splits/train_GO.fasta
+  VAL_DATA_PATH: sequences/uniprot_sprot_2025_01_with_struct/splits/dev_GO.fasta
+  TEST_DATA_PATH: sequences/uniprot_sprot_2025_01_with_struct/splits/test_GO.fasta
+  TEST_TOP_LABELS_DATA_PATH: sequences/uniprot_sprot_2025_01_with_struct/splits/test_top_labels_GO.fasta
 
-  FULL_DATA_PATH: sequences/uniprot_sprot_2025_01/full_GO.fasta # used to generate vocabularies
+  FULL_DATA_PATH: sequences/uniprot_sprot_2025_01_with_struct/full_GO.fasta # used to generate vocabularies
   # WIP: Implementation for zero-shot
   FULL_EC_DATA_PATH: swissprot/proteinfer_splits/random/full_EC.fasta # used to generate vocabularies
 
@@ -26,7 +26,7 @@ data_paths:
   EC_ANNOTATIONS_PATH: annotations/ec_annotations_2025_02_06.pkl
 
   # Embeddings paths (if using frozen pre-trained models)
-  GO_BASE_LABEL_EMBEDDING_PATH: embeddings/go_frozen_label_embeddings.pt # this is the base path which is modified by POOLING_METHOD
+  GO_BASE_LABEL_EMBEDDING_PATH: embeddings/go_frozen_label_embeddings_2025_02_06.pt # this is the base path which is modified by POOLING_METHOD
   # WIP: Implementation of EC handling
   EC_BASE_LABEL_EMBEDDING_PATH: embeddings/ec_frozen_label_embeddings.pt # this is the base path which is modified by POOLING_METHOD
 
@@ -36,6 +36,7 @@ data_paths:
 
   # SwissProt
   SWISSPROT_2025_01_PATH: swissprot/uniprot_sprot_2025_01.dat
+  SWISSPROT_PICKLE_2025_01_PATH: swissprot/uniprot_sprot_2025_01_with_struct.pkl
 
   # Legacy structural pipeline (only used with legacy residue-level EGNN, not hybrid encoder)
   # These paths are for backward compatibility with the old PyG-based structural encoder

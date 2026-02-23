@@ -2,10 +2,10 @@
 
 ### V100 ###
 # Batch sizes
-TRAIN_BATCH_SIZE: 2 # 8 per GPU for V100 (64 if using 8 GPUs)
-VALIDATION_BATCH_SIZE: 2 # 32 per GPU for V100 (256 if using 8 GPUs)
+TRAIN_BATCH_SIZE: 8 # 8 per GPU for V100 (64 if using 8 GPUs)
+VALIDATION_BATCH_SIZE: 8 # 32 per GPU for V100 (256 if using 8 GPUs)
 TEST_BATCH_SIZE: 8 # 32 per GPU for V100 (256 if using 8 GPUs)
-MAX_ATOMS_PER_BATCH: null  # null = fixed batch size; e.g. 20000 for dynamic batching
+MAX_ATOMS_PER_BATCH: null # null = fixed batch size; e.g. 20000 for dynamic batching
 
 # Sampling
 GRID_SAMPLER: false
@@ -67,16 +67,16 @@ LABEL_SMOOTHING: 0.0 # Currently only implemented for FocalLoss
 
 # Protein encoder settings
 # Default: Hybrid ESM-C + EGNN encoder (use --use-sequence-encoder flag for legacy ProteInfer)
-USE_PLM_EMBEDDINGS: true        # True: use ESM-C embeddings; False: use learned AA embeddings
-LEARNED_AA_EMBEDDING_DIM: 128   # Dimension of learned AA embeddings (only used if USE_PLM_EMBEDDINGS=False)
-EGNN_HIDDEN_DIM: 256            # EGNN hidden dimension
-EGNN_OUT_DIM: 256               # EGNN output dimension (before projection)
-EGNN_N_LAYERS: 4                # Number of EGNN layers
-TRAIN_PROTEIN_ENCODER: true     # Whether to train the protein encoder
+USE_PLM_EMBEDDINGS: true # True: use ESM-C embeddings; False: use learned AA embeddings
+LEARNED_AA_EMBEDDING_DIM: 128 # Dimension of learned AA embeddings (only used if USE_PLM_EMBEDDINGS=False)
+EGNN_HIDDEN_DIM: 256 # EGNN hidden dimension
+EGNN_OUT_DIM: 256 # EGNN output dimension (before projection)
+EGNN_N_LAYERS: 4 # Number of EGNN layers
+TRAIN_PROTEIN_ENCODER: true # Whether to train the protein encoder
 
 # Legacy ProteInfer encoder settings (only used with --use-sequence-encoder flag)
-PRETRAINED_SEQUENCE_ENCODER: true
-TRAIN_SEQUENCE_ENCODER: true    # Whether to train ProteInfer encoder
+PRETRAINED_SEQUENCE_ENCODER: false
+TRAIN_SEQUENCE_ENCODER: true # Whether to train ProteInfer encoder
 LABEL_ENCODER_NUM_TRAINABLE_LAYERS: 0
 DISTRIBUTE_LABELS: false
 TRAIN_PROJECTION_HEAD: true
@@ -96,9 +96,9 @@ LABEL_AUGMENTATION_DESCRIPTIONS: name+label # Specifies what descriptions to use
 LABEL_EMBEDDING_NOISING_ALPHA: 20.0 # 0.0 = no noising. Typical ranges are <20. Noising scalar from https://arxiv.org/pdf/2310.05914.pdf
 
 # Interpretability (Phase 5): none = no interpretability loss; IntegratedGradient = IG + site ground truth MSE
-INTERPRETABILITY_METHOD: IntegratedGradient  # none | IntegratedGradient
-INTERPRETABILITY_WEIGHT: 0.1   # weight for interpretability loss (MSE between IG attribution and site-based target)
-INTERPRETABILITY_N_STEPS: 50   # number of steps for Integrated Gradients approximation
+INTERPRETABILITY_METHOD: IntegratedGradient # none | IntegratedGradient
+INTERPRETABILITY_WEIGHT: 0.1 # weight for interpretability loss (MSE between IG attribution and site-based target)
+INTERPRETABILITY_N_STEPS: 50 # number of steps for Integrated Gradients approximation
 
 # Constants
 SEED: 42
