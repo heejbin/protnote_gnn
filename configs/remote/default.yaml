@@ -3,7 +3,7 @@
 ZENODO_ORIGINAL_DATA: https://zenodo.org/records/13897920/files/data.zip?download=1
 
 # Modified data on HuggingFace
-HUGGINGFACE_DATA_REPO: cs527-toxinnote/protnote_data
+HUGGINGFACE_DATA_REPO: cs527-toxinnote/toxinnote_pretrain
 
 # RCSB PDB: https://www.rcsb.org/docs/programmatic-access/file-download-services
 RCSB_PDB_URL: https://files.rcsb.org/download
@@ -11,3 +11,8 @@ RCSB_PDB_URL: https://files.rcsb.org/download
 # AlphaFold DB:
 ALPHAFOLD_DB_API: https://alphafold.ebi.ac.uk/api/prediction
 ALPHAFOLD_DB_URL: https://alphafold.ebi.ac.uk/files
+ALPHAFOLD_SWISSPROT_URL: https://ftp.ebi.ac.uk/pub/databases/alphafold/latest/swissprot_cif_v6.tar
+
+# Atomistica (curated AFDB)
+# See https://catalog.ngc.nvidia.com/orgs/nvidia/teams/clara/resources/proteina-atomistica_data?version=release
+ATOMISTICA_URL: https://api.ngc.nvidia.com/v2/resources/org/nvidia/team/clara/proteina-atomistica_data/release/files?redirect=true&path=atomistica_cd_dataset.tar.gz
