@@ -383,7 +383,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--parsed-latest-swissprot-file",
         type=str,
-        default="swissprot_2024_full.pkl",
         help="Path to the latest parsed SwissProt file if exists. Otherwise will be created for caching purposes. Date should match latest-go-annotations-file",
     )
     parser.add_argument(
