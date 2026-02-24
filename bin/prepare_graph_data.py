@@ -4,7 +4,7 @@ Reads parsed structures and pre-computed ESM-C embeddings, builds atom-level
 graphs with combined covalent + k-NN edges, and saves final tensors.
 
 Supports multiprocessing for parallel graph construction and optional
-consolidation into a single indexed archive file (.tngrph).
+consolidation into a single indexed archive file (.pngrph).
 
 Example Usage:
     python bin/prepare_graph_data.py \
@@ -20,6 +20,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import signal
 from pathlib import Path
 
 import torch
@@ -27,7 +28,11 @@ from tqdm import tqdm
 
 from protnote.utils.configs import get_project_root, register_resolvers
 from protnote.utils.data import read_fasta
-from protnote.utils.graph_archive import consolidate_to_archive
+from protnote.utils.graph_archive import (
+    consolidate_to_archive,
+    consolidate_to_sharded_archive,
+    open_archive,
+)
 from protnote.utils.structure import extract_aa_residue_by_chain_ids
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
@@ -55,7 +60,15 @@ def collect_sequences_map(fasta_paths: list[Path]) -> dict[str, str]:
 _worker_ctx = {}
 
 
-def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_map, knn_k):
+class _ProcessingTimeout(Exception):
+    """Raised by SIGALRM when a single protein exceeds the time limit."""
+
+
+def _sigalrm_handler(signum, frame):
+    raise _ProcessingTimeout
+
+
+def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_map, knn_k, local_afdb_dir=None, local_afdb_suffix=None, timeout=0):
     """Called once per worker process to store shared config and import heavy modules."""
     _worker_ctx["structure_dir"] = Path(structure_dir)
     _worker_ctx["esmc_dir"] = Path(esmc_dir)
@@ -63,6 +76,12 @@ def _worker_init(structure_dir, esmc_dir, structure_index, esmc_index, sequence_
     _worker_ctx["esmc_index"] = esmc_index
     _worker_ctx["sequence_map"] = sequence_map
     _worker_ctx["knn_k"] = knn_k
+    _worker_ctx["local_afdb_dir"] = Path(local_afdb_dir) if local_afdb_dir else None
+    _worker_ctx["local_afdb_suffix"] = local_afdb_suffix
+    _worker_ctx["timeout"] = timeout
+
+    if timeout > 0:
+        signal.signal(signal.SIGALRM, _sigalrm_handler)
 
     # Import heavy modules once per worker (avoid repeated import overhead)
     from protnote.utils.structure import (
@@ -87,9 +106,22 @@ def _process_one(seq_id: str) -> dict:
         or {"seq_id": str, "status": "failed", "reason": str}
     """
     ctx = _worker_ctx
+    timeout = ctx.get("timeout", 0)
     try:
+        if timeout > 0:
+            signal.alarm(timeout)
+
         struct_info = ctx["structure_index"][seq_id]
-        cif_path = ctx["structure_dir"] / struct_info["path"]
+
+        # Resolve structure file path: use local AFDB folder for alphafolddb entries if configured
+        if (
+            ctx["local_afdb_dir"]
+            and struct_info.get("source") == "alphafolddb"
+        ):
+            afdb_filename = f"AF-{seq_id}-F1-model_{ctx['local_afdb_suffix']}.pdb"
+            cif_path = ctx["local_afdb_dir"] / afdb_filename
+        else:
+            cif_path = ctx["structure_dir"] / struct_info["path"]
 
         if not cif_path.exists():
             return {"seq_id": seq_id, "status": "failed", "reason": "structure_file_missing"}
@@ -151,11 +183,17 @@ def _process_one(seq_id: str) -> dict:
             "seq_id": seq_id,
             "status": "ok",
             "filename": f"{seq_id}.pt",
+            "n_atoms": output["n_atoms"],
             "data_bytes": buf.getvalue(),
         }
 
+    except _ProcessingTimeout:
+        return {"seq_id": seq_id, "status": "failed", "reason": f"timeout (>{timeout}s)"}
     except Exception as e:
         return {"seq_id": seq_id, "status": "failed", "reason": str(e)}
+    finally:
+        if timeout > 0:
+            signal.alarm(0)
 
 
 def main():
@@ -191,10 +229,32 @@ def main():
         help="Skip consolidation into a single archive file.",
     )
     parser.add_argument(
+        "--num-shards",
+        type=int,
+        default=1,
+        help="Number of archive shards (default: 1 = single file). "
+        "Set to e.g. 16 for large datasets.",
+    )
+    parser.add_argument(
         "--keep-individual-files",
         action="store_true",
         default=False,
         help="Keep individual .pt files after archiving (default: delete them).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="Per-protein timeout in seconds (default: 300). "
+        "Proteins exceeding this are marked failed and retried on the next run. "
+        "Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--local-afdb",
+        action="store_true",
+        default=False,
+        help="Use local AFDB folder for alphafolddb structures instead of downloaded CIF files. "
+        "Expects files named AF-<UNIPROT_ID>-F1-model_<SUFFIX>.pdb in LOCAL_AFDB_DIR.",
     )
     args = parser.parse_args()
 
@@ -218,6 +278,21 @@ def main():
     )
     esmc_dir = Path(DATA_PATH / cfg.paths.data_paths.get("ESMC_EMBEDDING_DIR", "embeddings/esmc"))
     esmc_index_path = Path(DATA_PATH / cfg.paths.data_paths.get("ESMC_INDEX_PATH", "embeddings/esmc/esmc_index.json"))
+
+    # Local AFDB configuration
+    local_afdb_dir = None
+    local_afdb_suffix = None
+    if args.local_afdb:
+        local_afdb_rel = cfg.paths.data_paths.get("LOCAL_AFDB_DIR", "")
+        if not local_afdb_rel:
+            logger.error("--local-afdb requires LOCAL_AFDB_DIR to be set in config.")
+            return
+        local_afdb_dir = Path(DATA_PATH / local_afdb_rel)
+        local_afdb_suffix = cfg.paths.data_paths.get("LOCAL_AFDB_SUFFIX", "v4")
+        if not local_afdb_dir.exists():
+            logger.error(f"Local AFDB directory not found: {local_afdb_dir}")
+            return
+        logger.info(f"Using local AFDB structures from {local_afdb_dir} (suffix={local_afdb_suffix})")
 
     if not structure_index_path.exists():
         logger.error(f"Structure index not found: {structure_index_path}. Run download_structures.py first.")
@@ -287,6 +362,9 @@ def main():
                     esmc_index,
                     sequence_map,
                     knn_k,
+                    str(local_afdb_dir) if local_afdb_dir else None,
+                    local_afdb_suffix,
+                    args.timeout,
                 ),
             ) as pool:
                 results = pool.imap_unordered(_process_one, remaining, chunksize=args.chunksize)
@@ -295,7 +373,10 @@ def main():
                         out_path = output_dir / result["filename"]
                         with open(out_path, "wb") as f:
                             f.write(result["data_bytes"])
-                        graph_index[result["seq_id"]] = result["filename"]
+                        graph_index[result["seq_id"]] = {
+                            "filename": result["filename"],
+                            "n_atoms": result["n_atoms"],
+                        }
                         processed += 1
 
                         if processed % 500 == 0:
@@ -315,6 +396,9 @@ def main():
                 esmc_index,
                 sequence_map,
                 knn_k,
+                str(local_afdb_dir) if local_afdb_dir else None,
+                local_afdb_suffix,
+                args.timeout,
             )
             for seq_id in tqdm(remaining, desc="Preparing graph data"):
                 result = _process_one(seq_id)
@@ -322,7 +406,10 @@ def main():
                     out_path = output_dir / result["filename"]
                     with open(out_path, "wb") as f:
                         f.write(result["data_bytes"])
-                    graph_index[result["seq_id"]] = result["filename"]
+                    graph_index[result["seq_id"]] = {
+                        "filename": result["filename"],
+                        "n_atoms": result["n_atoms"],
+                    }
                     processed += 1
 
                     if processed % 500 == 0:
@@ -346,15 +433,20 @@ def main():
 
     # --- Consolidation ---
     if not args.no_consolidate and graph_index:
-        archive_path = output_dir / "graphs.pngrph"
-        logger.info(f"Consolidating {len(graph_index)} graphs into {archive_path}")
-        n_archived = consolidate_to_archive(output_dir, graph_index, archive_path)
+        num_shards = args.num_shards
+        if num_shards > 1:
+            logger.info(f"Consolidating {len(graph_index)} graphs into {num_shards} shards in {output_dir}")
+            n_archived = consolidate_to_sharded_archive(output_dir, graph_index, output_dir, num_shards)
+        else:
+            archive_path = output_dir / "graphs.pngrph"
+            logger.info(f"Consolidating {len(graph_index)} graphs into {archive_path}")
+            n_archived = consolidate_to_archive(output_dir, graph_index, archive_path)
 
         if n_archived > 0 and not args.keep_individual_files:
             logger.info("Removing individual .pt files...")
             removed = 0
-            for filename in graph_index.values():
-                pt_path = output_dir / filename
+            for entry in graph_index.values():
+                pt_path = output_dir / entry["filename"]
                 if pt_path.exists():
                     pt_path.unlink()
                     removed += 1
@@ -362,17 +454,17 @@ def main():
 
     # Print summary
     if graph_index:
-        # Try loading from archive first, then individual file
-        archive_path = output_dir / "graphs.pngrph"
         sample_id = next(iter(graph_index))
-        if archive_path.exists():
-            from protnote.utils.graph_archive import GraphArchiveReader
-
-            reader = GraphArchiveReader(archive_path)
+        # Try loading from archive (single or sharded), then individual file
+        archive_path = output_dir / "graphs.pngrph"
+        shard_files = list(output_dir.glob("graphs.shard-*-of-*.pngrph"))
+        if archive_path.exists() or shard_files:
+            archive_source = archive_path if archive_path.exists() else output_dir
+            reader = open_archive(archive_source)
             sample = reader[sample_id]
             reader.close()
         else:
-            sample = torch.load(output_dir / graph_index[sample_id], weights_only=False)
+            sample = torch.load(output_dir / graph_index[sample_id]["filename"], weights_only=False)
         logger.info(
             f"Sample output ({sample_id}): "
             f"atoms={sample['n_atoms']}, residues={sample['n_residues']}, "

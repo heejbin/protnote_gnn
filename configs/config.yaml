@@ -8,14 +8,16 @@ defaults:
 
 # Runtime settings (previously argparse-only in main.py)
 run:
-  name: ProtNote
-  train_path_name: null
-  validation_path_name: null
-  test_paths_names: null
-  full_path_name: null
+  name: ToxinNote
+  train_path_name: TRAIN_DATA_PATH
+  validation_path_name: VAL_DATA_PATH
+  test_paths_names:
+    - TEST_DATA_PATH
+  full_path_name: FULL_DATA_PATH
   annotations_path_name: GO_ANNOTATIONS_PATH
   base_label_embedding_name: GO_BASE_LABEL_EMBEDDING_PATH
-  wandb_project: null
+  wandb_project: "toxinnote"
+  wandb_entity: "cs527-toxinnote"
   from_checkpoint: false
   amlt: false
   mlflow: false

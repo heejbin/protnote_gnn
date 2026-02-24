@@ -2,15 +2,16 @@
 
 import argparse
 import logging
+import os
 import zipfile
 from pathlib import Path
 
 import requests
 from huggingface_hub import HfApi, login, snapshot_download
-
-from protnote.utils.configs import get_project_root, register_resolvers
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
+
+from protnote.utils.configs import get_project_root, register_resolvers
 
 project_root = get_project_root()
 register_resolvers()
@@ -49,8 +50,24 @@ def _fetch_data_published() -> None:
     (project_root / "data.zip").unlink()
 
 
-def data_upload(repo_id: str) -> None:
+def _check_num_files(directory: Path) -> list[str]:
+    """Check if any directory has more than 2,000 files at its own level."""
+    result = []
+    for dirpath, dirnames, filenames in os.walk(directory):
+        if len(filenames) > 2000:
+            result.append(dirpath)
+    return result
+
+
+def data_upload(repo_id: str, ignore_num_files: bool = False) -> None:
     """Upload data directory to HuggingFace Hub Repository."""
+    if not ignore_num_files:
+        dirpaths = _check_num_files(project_root / "data")
+        if dirpaths:
+            raise ValueError(
+                f"Directories {', '.join(dirpaths)} have more than 2,000 files. "
+                "Compress them before uploading, or you can use --ignore-num-files to bypass."
+            )
     api = HfApi()
     api.upload_large_folder(repo_id=repo_id, repo_type="model", folder_path=project_root / "data")
 
@@ -71,6 +88,7 @@ if __name__ == "__main__":
     parser.add_argument("action", choices=["upload", "download"], help="Action: upload / download")
     parser.add_argument("--original", action="store_true", help="Download original published data")
     parser.add_argument("--repo_id", type=str, default=None, help="HuggingFace repository ID")
+    parser.add_argument("--ignore-num-files", action="store_true", help="Ignore number of files check")
     args = parser.parse_args()
 
     if not args.original:
@@ -82,6 +100,6 @@ if __name__ == "__main__":
             args.repo_id = datapath_remote["HUGGINGFACE_DATA_REPO"]
 
     if args.action == "upload":
-        data_upload(args.repo_id)
+        data_upload(args.repo_id, args.ignore_num_files)
     elif args.action == "download":
         data_download(args.repo_id, args.original)

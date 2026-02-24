@@ -7,12 +7,12 @@ import pandas as pd
 from Bio import SeqIO, SwissProt
 from Bio.Seq import Seq
 from Bio.SeqRecord import SeqRecord
+from hydra import compose, initialize_config_dir
+from hydra.core.global_hydra import GlobalHydra
 from tqdm import tqdm
 
 from protnote.utils.configs import construct_absolute_paths, get_logger, get_project_root, register_resolvers
 from protnote.utils.data import COMMON_AMINOACIDS, generate_vocabularies, read_fasta, read_json
-from hydra import compose, initialize_config_dir
-from hydra.core.global_hydra import GlobalHydra
 
 logger = get_logger()
 
@@ -65,14 +65,89 @@ def _filter_structure_exprs(seq_len, records: list[tuple[str, ...]]) -> list[tup
     return comp_structures or None
 
 
+def _load_plddt_map(plddt_file: str) -> dict[str, float]:
+    """Load a mapping of seq_id -> average pLDDT from a JSON or pickle file.
+
+    Supported formats:
+      - JSON: {"P12345": 92.3, "Q67890": 85.1, ...}
+      - Pickle (DataFrame): expects 'seq_id' and 'afdb_avg_plddt' columns
+        (e.g., output of download_structures.py)
+    """
+    if plddt_file.endswith(".json"):
+        return read_json(plddt_file)
+    elif plddt_file.endswith(".pkl") or plddt_file.endswith(".pickle"):
+        df = pd.read_pickle(plddt_file)
+        if "seq_id" in df.columns and "afdb_avg_plddt" in df.columns:
+            subset = df.dropna(subset=["afdb_avg_plddt"])
+            return dict(zip(subset["seq_id"], subset["afdb_avg_plddt"].astype(float)))
+        raise ValueError(f"Pickle file {plddt_file} must contain 'seq_id' and 'afdb_avg_plddt' columns.")
+    else:
+        raise ValueError(f"Unsupported pLDDT file format: {plddt_file}. Use .json or .pkl")
+
+
+def _apply_structure_filter(
+    df: pd.DataFrame,
+    structure_filter: str,
+    min_plddt: float | None,
+    plddt_map: dict[str, float] | None,
+) -> pd.DataFrame:
+    """Filter DataFrame rows by structure availability and pLDDT quality.
+
+    Args:
+        df: DataFrame with 'struct_expr' and 'struct_afdb' columns.
+        structure_filter: One of 'none', 'any', 'pdb', 'afdb'.
+        min_plddt: Minimum average pLDDT threshold for AFDB entries.
+            Entries without pLDDT data are dropped when this is set.
+        plddt_map: Mapping seq_id -> avg pLDDT (required when min_plddt is set).
+
+    Returns:
+        Filtered DataFrame.
+    """
+    n_before = len(df)
+
+    if structure_filter == "none":
+        pass
+    elif structure_filter == "any":
+        df = df[df["struct_expr"].notna() | df["struct_afdb"].notna()]
+    elif structure_filter == "pdb":
+        df = df[df["struct_expr"].notna()]
+    elif structure_filter == "afdb":
+        df = df[df["struct_afdb"].notna()]
+    else:
+        raise ValueError(f"Unknown structure_filter: {structure_filter}")
+
+    if structure_filter != "none":
+        logger.info(f"Structure filter '{structure_filter}': {n_before} -> {len(df)} sequences ({n_before - len(df)} dropped)")
+
+    if min_plddt is not None:
+        if plddt_map is None:
+            raise ValueError("--plddt-file is required when --min-plddt is set")
+        n_before_plddt = len(df)
+        has_afdb = df["struct_afdb"].notna()
+        plddt_values = df["seq_id"].map(plddt_map)
+        # Keep entries that: (a) have no AFDB (PDB-only, unaffected), or
+        #                     (b) have AFDB with pLDDT >= threshold.
+        # Drop AFDB entries missing from the pLDDT map.
+        passes_plddt = ~has_afdb | (plddt_values >= min_plddt)
+        df = df[passes_plddt]
+        logger.info(f"pLDDT filter (>= {min_plddt}): {n_before_plddt} -> {len(df)} sequences ({n_before_plddt - len(df)} dropped)")
+
+    return df
+
+
 def main(
     latest_swissprot_file: str,
     output_file_path: str,
     parenthood_file: str,
     label_vocabulary: Literal["proteinfer", "new", "all"],
     sequence_vocabulary: Literal["proteinfer_test", "proteinfer_test", "new", "all"],
+    annotations_file: str,
     only_leaf_nodes: bool = False,
     cache=True,
+    structure_filter: str = "none",
+    min_plddt: float | None = None,
+    plddt_file: str | None = None,
+    baseline_annotations_file: str | None = None,
 ):
     # Load the configuration and project root
 
@@ -191,17 +266,22 @@ def main(
     else:
         df_latest = pd.read_pickle(swissprot_dir / args.parsed_latest_swissprot_file)
 
-    # Make a set of the GO labels from the label embeddings
-    label_ids_2019 = set(pd.read_pickle(annotations_dir / "go_annotations_2019_07_01.pkl").index)
-    annotations_latest = pd.read_pickle(annotations_dir / args.latest_go_annotations_file)
-    pinf_train = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TRAIN_DATA_PATH))
-    pinf_val = read_fasta(str(project_root / "data" / cfg.paths.data_paths.VAL_DATA_PATH))
-    pinf_test = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TEST_DATA_PATH))
+    # Apply structure / pLDDT filter
+    plddt_map = _load_plddt_map(plddt_file) if plddt_file else None
+    df_latest = _apply_structure_filter(df_latest, structure_filter, min_plddt, plddt_map)
 
-    label_ids_2024 = set(annotations_latest.index)
+    # Load annotations
+    annotations = pd.read_pickle(annotations_dir / annotations_file)
+    label_ids = set(annotations.index)
 
-    # Find added labels
-    new_go_labels = label_ids_2024 - label_ids_2019
+    # Find added labels (only when label_vocabulary="new")
+    new_go_labels = set()
+    if label_vocabulary == "new":
+        if baseline_annotations_file is None:
+            raise ValueError("--baseline-annotations-file is required when --label-vocabulary=new")
+        baseline_label_ids = set(pd.read_pickle(annotations_dir / baseline_annotations_file).index)
+        new_go_labels = label_ids - baseline_label_ids
+        logger.info(f"Label diff: {len(label_ids)} (annotations) - {len(baseline_label_ids)} (baseline) = {len(new_go_labels)} new labels")
 
     parenthood = read_json(project_root / "data" / "vocabularies" / parenthood_file)
 
@@ -209,8 +289,8 @@ def main(
     leaf_nodes = []
     for parent, children in reverse_parenthood.items():
         leaf_node = list(children)[0]
-        if "GO" in parent and len(children) == 1 and leaf_node in annotations_latest.index:
-            if "obsolete" not in annotations_latest.loc[leaf_node, "name"]:
+        if "GO" in parent and len(children) == 1 and leaf_node in annotations.index:
+            if "obsolete" not in annotations.loc[leaf_node, "name"]:
                 leaf_nodes.append(leaf_node)
     leaf_nodes = set(leaf_nodes)
 
@@ -223,18 +303,22 @@ def main(
     # Update go terms to include all parents
     df_latest["go_ids"] = df_latest["go_ids"].apply(add_go_parents)
 
+    # Filter sequences based on sequence_vocabulary.
+    # "new", "proteinfer_test", "proteinfer_train" require pre-existing ProteInfer
+    # FASTA splits; "all" does not.
     if sequence_vocabulary == "new":
-        sequence_ids_2019 = set([id for _, id, _ in pinf_train + pinf_val])
-        in_proteinfer_train_val = df_latest.seq_id.apply(lambda x: x in sequence_ids_2019)
-        df_latest = df_latest[(in_proteinfer_train_val == False)]
+        pinf_train = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TRAIN_DATA_PATH))
+        pinf_val = read_fasta(str(project_root / "data" / cfg.paths.data_paths.VAL_DATA_PATH))
+        existing_seq_ids = set(id for _, id, _ in pinf_train + pinf_val)
+        df_latest = df_latest[~df_latest.seq_id.isin(existing_seq_ids)]
     elif sequence_vocabulary == "proteinfer_test":
-        proteinfer_test_set_seqs = set([id for _, id, _ in pinf_test])
-        in_proteinfer_test = df_latest.seq_id.apply(lambda x: x in proteinfer_test_set_seqs)
-        df_latest = df_latest[(in_proteinfer_test == True)]
+        pinf_test = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TEST_DATA_PATH))
+        proteinfer_test_set_seqs = set(id for _, id, _ in pinf_test)
+        df_latest = df_latest[df_latest.seq_id.isin(proteinfer_test_set_seqs)]
     elif sequence_vocabulary == "proteinfer_train":
-        proteinfer_train_set_seqs = set([id for _, id, _ in pinf_train])
-        in_proteinfer_train = df_latest.seq_id.apply(lambda x: x in proteinfer_train_set_seqs)
-        df_latest = df_latest[(in_proteinfer_train == True)]
+        pinf_train = read_fasta(str(project_root / "data" / cfg.paths.data_paths.TRAIN_DATA_PATH))
+        proteinfer_train_set_seqs = set(id for _, id, _ in pinf_train)
+        df_latest = df_latest[df_latest.seq_id.isin(proteinfer_train_set_seqs)]
     elif sequence_vocabulary == "all":
         pass
     else:
@@ -252,7 +336,7 @@ def main(
 
     logger.info("filtering labels")
     # Find protein sequences with added labels
-    df_latest["go_ids"] = df_latest.go_ids.apply(lambda x: (set(x) & vocab))
+    df_latest["go_ids"] = df_latest.go_ids.apply(lambda x: set(x) & vocab)
 
     # Remove sequences with no applicable labels
     df_latest = df_latest[(df_latest.go_ids != set())]
@@ -299,14 +383,21 @@ if __name__ == "__main__":
     parser.add_argument(
         "--parsed-latest-swissprot-file",
         type=str,
-        default="swissprot_2024_full.pkl",
         help="Path to the latest parsed SwissProt file if exists. Otherwise will be created for caching purposes. Date should match latest-go-annotations-file",
     )
     parser.add_argument(
-        "--latest-go-annotations-file",
+        "--annotations-file",
         type=str,
-        default="go_annotations_jul_2024.pkl",
-        help="Path to the latest go annotations file available. Date should match parsed-latest-swissprot-file",
+        required=True,
+        help="Annotations pickle file in data/annotations/ (e.g., go_annotations_jul_2024.pkl). "
+        "Used as the label source and for leaf-node filtering.",
+    )
+    parser.add_argument(
+        "--baseline-annotations-file",
+        type=str,
+        default=None,
+        help="Baseline annotations pickle file in data/annotations/ for computing 'new' labels. "
+        "Required when --label-vocabulary=new. New labels = annotations - baseline.",
     )
     parser.add_argument(
         "--parenthood-file",
@@ -342,7 +433,31 @@ if __name__ == "__main__":
         default=None,
         help="keywords to filter the dataset",
     )
+    parser.add_argument(
+        "--structure-filter",
+        choices=["none", "any", "pdb", "afdb"],
+        default="none",
+        help="Filter to entries with structures: none (default), any (PDB or AFDB), pdb, afdb.",
+    )
+    parser.add_argument(
+        "--min-plddt",
+        type=float,
+        default=None,
+        help="Minimum average pLDDT for AFDB entries. Requires --plddt-file.",
+    )
+    parser.add_argument(
+        "--plddt-file",
+        type=str,
+        default=None,
+        help="Path to pLDDT values: JSON {seq_id: plddt} or pickle with 'seq_id'+'afdb_avg_plddt' columns "
+        "(e.g., uniprot_structures.pkl from download_structures.py).",
+    )
     args = parser.parse_args()
+
+    if args.min_plddt is not None and args.plddt_file is None:
+        parser.error("--min-plddt requires --plddt-file")
+    if args.label_vocabulary == "new" and args.baseline_annotations_file is None:
+        parser.error("--baseline-annotations-file is required when --label-vocabulary=new")
 
     main(
         latest_swissprot_file=args.latest_swissprot_file,
@@ -350,6 +465,11 @@ if __name__ == "__main__":
         parenthood_file=args.parenthood_file,
         label_vocabulary=args.label_vocabulary,
         sequence_vocabulary=args.sequence_vocabulary,
+        annotations_file=args.annotations_file,
         only_leaf_nodes=args.only_leaf_nodes,
         cache=not args.no_cache,
+        structure_filter=args.structure_filter,
+        min_plddt=args.min_plddt,
+        plddt_file=args.plddt_file,
+        baseline_annotations_file=args.baseline_annotations_file,
     )

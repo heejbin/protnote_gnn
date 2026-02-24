@@ -1,6 +1,8 @@
 # ToxinNote Training Guide
 
-This guide walks through the complete pipeline for training a ToxinNote model — from environment setup and data preparation through training, evaluation, and inference.
+This guide covers environment setup, configuration, training, evaluation, and inference for ToxinNote models.
+
+For data preparation (downloading, preprocessing, embedding generation), see the [Data Preparation Guide](data_guide.md).
 
 ---
 
@@ -8,12 +10,11 @@ This guide walks through the complete pipeline for training a ToxinNote model �
 
 1. [Prerequisites](#1-prerequisites)
 2. [Environment Setup](#2-environment-setup)
-3. [Data Preparation](#3-data-preparation)
-4. [Configuration System](#4-configuration-system)
-5. [Training](#5-training)
-6. [Evaluation and Testing](#6-evaluation-and-testing)
-7. [Inference](#7-inference)
-8. [Advanced Topics](#8-advanced-topics)
+3. [Configuration System](#3-configuration-system)
+4. [Training](#4-training)
+5. [Evaluation and Testing](#5-evaluation-and-testing)
+6. [Inference](#6-inference)
+7. [Advanced Topics](#7-advanced-topics)
 
 ---
 
@@ -22,202 +23,29 @@ This guide walks through the complete pipeline for training a ToxinNote model �
 - **Hardware**: NVIDIA GPU with CUDA 11.8+
 - **Software**: Python 3.10+, [Pixi](https://pixi.sh/) package manager
 - **Platform**: Linux (x86_64)
+- **Data**: Complete the [Data Preparation Guide](data_guide.md) before training
 
 ## 2. Environment Setup
 
-```bash
-# Clone the repository
-git clone <repo-url> && cd toxinnote-dev
+The project defines two pixi environments:
 
-# Activate the environment (installs all dependencies automatically)
+| Environment | Command | Platforms | Includes | Use for |
+|-------------|---------|-----------|----------|---------|
+| `default` | `pixi shell` | Linux (x86_64) | All dependencies (PyTorch, CUDA, torch-geometric, etc.) | Training, evaluation, inference |
+| `dataprep` | `pixi shell -e dataprep` | Linux, macOS, Windows | Core packages only (no GPU deps) | Data downloading and preprocessing |
+
+```bash
+# Activate the full environment for training (Linux with GPU)
 pixi shell
 ```
 
 This installs PyTorch 2.4.0, Hydra, OmegaConf, transformers, ESM-C, AtomWorks, and all other dependencies defined in `pyproject.toml`.
 
-## 3. Data Preparation
-
-Data preparation has several stages. The quickstart path downloads pre-processed data. For custom datasets, follow the full pipeline.
-
-### 3.1 Download Pre-processed Data (Quickstart)
-
-```bash
-pixi run dataprep
-```
-
-This downloads the complete dataset from HuggingFace (`cs527-toxinnote/protnote_data`) into the `data/` directory, including:
-- FASTA files (train/val/test splits)
-- GO/EC annotations
-- Pre-computed label embeddings
-- ProteInfer model weights
-- Vocabularies
-
-After this step you can skip directly to [Section 3.6](#36-generate-esm-c-sequence-embeddings) if using the hybrid encoder, or [Section 5](#5-training) if using the legacy ProteInfer encoder.
-
-### 3.2 Create Datasets from Raw Sources (Optional)
-
-If you need to build datasets from scratch:
-
-**From ProteInfer TFRecords:**
-
-```bash
-python bin/make_proteinfer_dataset.py \
-    --dataset-type random \
-    --annotation-types GO
-```
-
-This converts TFRecord files into FASTA format with GO annotations in the sequence headers.
-
-**From SwissProt releases (for temporal splits / new GO terms):**
-
-```bash
-python bin/make_dataset_from_swissprot.py \
-    --latest-swissprot-file uniprot_sprot_jul_2024.dat \
-    --output-file-path data/swissprot/test_2024.fasta \
-    --label-vocabulary new \
-    --sequence-vocabulary new
-```
-
-**For zero-shot evaluation (label-disjoint splits):**
-
-```bash
-python bin/make_zero_shot_datasets_from_proteinfer.py
-```
-
-Creates 80/10/10 train/val/test splits where labels are disjoint across splits.
-
-### 3.3 Generate Parenthood JSON (Optional)
-
-Generate the GO/EC label hierarchy used for label normalization during evaluation:
-
-```bash
-# Auto-detect source files (latest .obo + enzyme files in data/annotations/)
-python bin/generate_parenthood.py
-
-# Or specify files explicitly
-python bin/generate_parenthood.py \
-    --go-obo data/annotations/go_2025-10-10.obo \
-    --enzyme-dat data/annotations/enzyme_251015.dat \
-    --enzclass-txt data/annotations/enzclass_251015.txt \
-    --output data/vocabularies/parenthood_2025_10.json
-```
-
-This replaces the proteinfer `parenthood_bin.py` dependency. Source files needed:
-- **GO**: A `.obo` file — download with `python bin/download_GO_annotations.py`
-- **EC**: `enzyme.dat` + `enzclass.txt` from [ExPASy](https://ftp.expasy.org/databases/enzyme/) (optional, use `--skip-ec` for GO only)
-
-Output: `data/vocabularies/parenthood_{date}.json` — referenced in config as `PARENTHOOD_LIB_PATH`.
-
-### 3.4 Download Protein Structures (Optional)
-
-Required only if you need structure files for new proteins not already in `data/structures/`.
-
-```bash
-python bin/download_structures.py \
-    --fasta-path data/swissprot/proteinfer_splits/random/train_GO.fasta \
-    --source alphafolddb
-```
-
-Downloads CIF/PDB files from AlphaFold DB or RCSB PDB into `data/structures/`.
-
-### 3.5 Generate Label Embeddings
-
-Pre-compute text embeddings for all GO term descriptions using Multilingual E5:
-
-```bash
-python bin/generate_label_embeddings.py \
-    --add-instruction \
-    --account-for-sos
-```
-
-**Options:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--pooling-method` | `mean` | Embedding pooling: `mean`, `last_token`, or `all` |
-| `--label-encoder-checkpoint` | `intfloat/multilingual-e5-large-instruct` | HuggingFace model |
-| `--base-label-embedding-path` | `GO_BASE_LABEL_EMBEDDING_PATH` | Config key for output path |
-| `--annotations-path-name` | `GO_ANNOTATIONS_2019_UPDATED_PATH` | Config key for annotations |
-| `--add-instruction` | off | Format input for instruction-tuned model |
-| `--account-for-sos` | off | Ignore SOS token in pooling |
-
-**For EC labels:**
-
-```bash
-python bin/generate_label_embeddings.py \
-    --base-label-embedding-path EC_BASE_LABEL_EMBEDDING_PATH \
-    --annotations-path-name EC_ANNOTATIONS_PATH \
-    --add-instruction --account-for-sos
-```
-
-Output: `data/embeddings/frozen_E5_multiling_inst_label_embeddings_mean.pt` (+ corresponding index file).
-
-### 3.6 Generate ESM-C Sequence Embeddings
-
-Required for the hybrid (ESM-C + EGNN) encoder. Generates per-residue embeddings (960-dim) for each protein:
-
-```bash
-python bin/generate_sequence_embeddings.py \
-    --fasta-path-names TRAIN_DATA_PATH VAL_DATA_PATH TEST_DATA_PATH \
-    --batch-size 16
-```
-
-**Options:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--model-name` | `esmc_300m` | ESM-C model variant |
-| `--batch-size` | `8` | Inference batch size |
-| `--max-sequence-length` | `5000` | Skip longer sequences |
-
-Output: Individual `.pt` files in `data/embeddings/esmc/` plus `index.json`.
-
-### 3.7 Build Atom-Level Graphs
-
-Combines structure files + ESM-C embeddings into atom-level graphs for the EGNN encoder:
-
-```bash
-python bin/prepare_graph_data.py \
-    --fasta-path-names TRAIN_DATA_PATH VAL_DATA_PATH TEST_DATA_PATH \
-    --num-workers 8 \
-    --knn-k 20 \
-    --consolidate
-```
-
-**What it does:**
-1. Parses CIF/PDB structure files (via AtomWorks)
-2. Loads pre-computed ESM-C per-residue embeddings
-3. Builds atom-level graphs (covalent bonds + k-NN spatial edges)
-4. Aligns ESM-C residue embeddings to structure atoms
-5. Saves as individual `.pt` graphs or a consolidated `.pngrph` archive
-
-**Options:**
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--num-workers` | `8` | Parallel processing workers |
-| `--knn-k` | `20` | Number of k-nearest-neighbor edges per atom |
-| `--consolidate` | off | Merge all graphs into a single `.pngrph` archive |
-
-Output: `data/processed/graphs.pngrph` (archive) + `data/processed/graph_index.json`.
-
-### Data Preparation Summary
-
-| Step | Script | Required For | Output |
-|------|--------|--------------|--------|
-| Download data | `pixi run dataprep` | All | `data/` directory |
-| Parenthood JSON | `generate_parenthood.py` | Evaluation (label normalization) | `data/vocabularies/parenthood_*.json` |
-| Label embeddings | `generate_label_embeddings.py` | All | `data/embeddings/*.pt` |
-| ESM-C embeddings | `generate_sequence_embeddings.py` | Hybrid encoder | `data/embeddings/esmc/*.pt` |
-| Atom graphs | `prepare_graph_data.py` | Hybrid encoder | `data/processed/graphs.pngrph` |
-
----
-
-## 4. Configuration System
+## 3. Configuration System
 
 ToxinNote uses [Hydra](https://hydra.cc/) for configuration management.
 
-### 4.1 Config Structure
+### 3.1 Config Structure
 
 ```
 configs/
@@ -233,37 +61,45 @@ configs/
     default.yaml               # Remote URLs (HuggingFace, AlphaFold DB)
 ```
 
-### 4.2 Runtime Settings (`config.yaml` → `run:`)
+### 3.2 Runtime Settings (`config.yaml` → `run:`)
 
 These control what the training script does:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `run.name` | `ProtNote` | Experiment name (used in checkpoints, logs, W&B) |
-| `run.train_path_name` | `null` | Config key for training FASTA (e.g., `TRAIN_DATA_PATH`) |
-| `run.validation_path_name` | `null` | Config key for validation FASTA |
-| `run.test_paths_names` | `null` | List of config keys for test FASTAs |
-| `run.full_path_name` | `null` | Config key for full dataset (vocabulary generation) |
+| `run.name` | `ToxinNote` | Experiment name (used in checkpoints, logs, W&B) |
+| `run.train_path_name` | `TRAIN_DATA_PATH` | Config key for training FASTA (set to `null` to skip training) |
+| `run.validation_path_name` | `VAL_DATA_PATH` | Config key for validation FASTA (set to `null` to skip) |
+| `run.test_paths_names` | `[TEST_DATA_PATH]` | List of config keys for test FASTAs (set to `null` to skip) |
+| `run.full_path_name` | `FULL_DATA_PATH` | Config key for full dataset (vocabulary generation) |
 | `run.annotations_path_name` | `GO_ANNOTATIONS_PATH` | Config key for GO/EC annotations |
 | `run.base_label_embedding_name` | `GO_BASE_LABEL_EMBEDDING_PATH` | Config key for label embeddings |
-| `run.wandb_project` | `null` | W&B project name (null = no logging) |
+| `run.wandb_project` | `toxinnote` | W&B project name (set to `null` to disable logging) |
+| `run.wandb_entity` | `cs527-toxinnote` | W&B entity/team name |
 | `run.model_file` | `null` | Checkpoint to load (filename in `data/models/ProtNote/`) |
 | `run.from_checkpoint` | `false` | Resume training from checkpoint (restores optimizer state) |
 | `run.save_prediction_results` | `false` | Save predictions as HDF5 |
 | `run.save_embeddings` | `false` | Save joint embeddings |
+| `run.save_val_test_metrics` | `false` | Append val/test metrics to a JSON file |
+| `run.save_val_test_metrics_file` | `val_test_metrics.json` | JSON file for accumulated metrics |
+| `run.eval_only_represented_labels` | `false` | Only evaluate labels represented in the dataset |
 | `run.use_sequence_encoder` | `false` | Use legacy ProteInfer CNN (default: hybrid EGNN) |
 | `run.gpus` | `1` | Number of GPUs per node |
 | `run.nodes` | `1` | Number of nodes |
+| `run.nr` | `0` | Node rank (set automatically when using AMLT) |
+| `run.amlt` | `false` | Running on AMLT (Azure ML) |
+| `run.mlflow` | `false` | Enable MLFlow logging (requires AMLT) |
 
-### 4.3 Key Hyperparameters (`params/default.yaml`)
+### 3.3 Key Hyperparameters (`params/default.yaml`)
 
 **Batch sizes and sampling:**
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `TRAIN_BATCH_SIZE` | `2` | Per-GPU training batch size |
-| `VALIDATION_BATCH_SIZE` | `2` | Per-GPU validation batch size |
-| `TEST_BATCH_SIZE` | `8` | Per-GPU test batch size |
+| `TRAIN_BATCH_SIZE` | `8` | Per-GPU training batch size (used when `MAX_ATOMS_PER_BATCH` is null) |
+| `VALIDATION_BATCH_SIZE` | `8` | Per-GPU validation batch size (used when `MAX_ATOMS_PER_BATCH` is null) |
+| `TEST_BATCH_SIZE` | `8` | Per-GPU test batch size (used when `MAX_ATOMS_PER_BATCH` is null) |
+| `MAX_ATOMS_PER_BATCH` | `null` | Max total atoms per batch for dynamic batching (null = use fixed batch size) |
 | `WEIGHTED_SAMPLING` | `true` | Over-sample rare sequences by inverse label frequency |
 | `INV_FREQUENCY_POWER` | `0.5` | Power for inverse frequency weighting |
 | `TRAIN_LABEL_SAMPLE_SIZE` | `null` | Sample K labels per batch (null = all) |
@@ -325,7 +161,7 @@ These control what the training script does:
 | `DECISION_TH` | `0.5` | Decision threshold (null = tune on validation set) |
 | `ESTIMATE_MAP` | `false` | Compute mean average precision |
 
-### 4.4 Data Path Keys (`paths/default.yaml`)
+### 3.4 Data Path Keys (`paths/default.yaml`)
 
 Path names referenced in CLI arguments map to relative paths under `data/`:
 
@@ -341,7 +177,7 @@ Path names referenced in CLI arguments map to relative paths under `data/`:
 | `GO_ANNOTATIONS_PATH` | `annotations/go_annotations_jul_2024.pkl` |
 | `GO_BASE_LABEL_EMBEDDING_PATH` | `embeddings/frozen_label_embeddings.pt` |
 
-### 4.5 Overriding Config at the Command Line
+### 3.5 Overriding Config at the Command Line
 
 All parameters can be overridden via Hydra CLI syntax:
 
@@ -361,11 +197,11 @@ python bin/main.py --cfg job
 
 ---
 
-## 5. Training
+## 4. Training
 
-### 5.1 Supervised Training (Hybrid Encoder — Default)
+### 4.1 Supervised Training (Hybrid Encoder — Default)
 
-The default encoder is the hybrid ESM-C + EGNN structure encoder. This requires pre-computed ESM-C embeddings and atom-level graphs (see [Section 3](#3-data-preparation)).
+The default encoder is the hybrid ESM-C + EGNN structure encoder. This requires pre-computed ESM-C embeddings and atom-level graphs (see [Data Preparation Guide](data_guide.md)).
 
 ```bash
 python bin/main.py \
@@ -392,7 +228,7 @@ python bin/main.py \
 10. Best checkpoint is saved based on `OPTIMIZATION_METRIC_NAME`
 11. Final evaluation on validation and test sets
 
-### 5.2 Supervised Training (Legacy ProteInfer Encoder)
+### 4.2 Supervised Training (Legacy ProteInfer Encoder)
 
 For sequence-only training without structure data:
 
@@ -406,7 +242,7 @@ python bin/main.py \
     run.name=protnote_cnn
 ```
 
-### 5.3 Zero-Shot Training
+### 4.3 Zero-Shot Training
 
 Train on a label-disjoint split to evaluate zero-shot generalization:
 
@@ -423,7 +259,7 @@ python bin/main.py \
 
 Note: `EXTRACT_VOCABULARIES_FROM=null` ensures vocabularies are built from the training set rather than the full dataset (important for proper zero-shot evaluation).
 
-### 5.4 Multi-GPU Training
+### 4.4 Multi-GPU Training
 
 ```bash
 python bin/main.py \
@@ -435,7 +271,7 @@ python bin/main.py \
 
 For multi-node training, also set `run.nodes` and `run.nr` (or use AMLT with `run.amlt=true`).
 
-### 5.5 Resume from Checkpoint
+### 4.5 Resume from Checkpoint
 
 ```bash
 python bin/main.py \
@@ -448,7 +284,7 @@ python bin/main.py \
 
 The `model_file` path is relative to `data/models/ProtNote/`. Setting `from_checkpoint=true` restores the optimizer state and epoch counter.
 
-### 5.6 Checkpoints
+### 4.6 Checkpoints
 
 During training, the trainer saves checkpoints to `outputs/checkpoints/`:
 
@@ -461,17 +297,17 @@ During training, the trainer saves checkpoints to `outputs/checkpoints/`:
 
 Each checkpoint contains: `model_state_dict`, `optimizer_state_dict`, `epoch`, `best_val_metric`.
 
-### 5.7 Logging
+### 4.7 Logging
 
 - **Console + file**: Logs are written to `outputs/logs/{timestamp}_{name}.log`
-- **Weights & Biases**: Set `run.wandb_project=<project>` to enable
-- **MLFlow**: Set `run.mlflow=true` (requires AMLT)
+- **Weights & Biases**: Enabled by default (`run.wandb_project=toxinnote`). Set to `null` to disable.
+- **MLFlow**: Set `run.mlflow=true` (requires `run.amlt=true`)
 
 ---
 
-## 6. Evaluation and Testing
+## 5. Evaluation and Testing
 
-### 6.1 Evaluate a Trained Model
+### 5.1 Evaluate a Trained Model
 
 Run inference and compute metrics on a test set:
 
@@ -499,7 +335,7 @@ python bin/main.py \
 
 Setting `DECISION_TH=null` triggers threshold optimization on the validation set before testing.
 
-### 6.2 Metrics
+### 5.2 Metrics
 
 The following metrics are computed:
 
@@ -515,7 +351,7 @@ The following metrics are computed:
 | `bce_loss` | Binary cross-entropy loss |
 | `focal_loss` | Focal loss |
 
-### 6.3 ProteInfer Baseline
+### 5.3 ProteInfer Baseline
 
 Test the standalone ProteInfer CNN baseline (no text encoder):
 
@@ -527,27 +363,67 @@ python bin/test_proteinfer.py \
     --threshold 0.5
 ```
 
-### 6.4 BLAST Baseline
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--validation-path-name` | `None` | Config key for validation FASTA |
+| `--test-paths-names` | `None` | Config key(s) for test FASTAs |
+| `--train-path-name` | `None` | Config key for training FASTA |
+| `--proteinfer-weights` | `GO` | Which model weights to use: `GO` or `EC` |
+| `--threshold` | `0.5` | Decision threshold for predictions |
+| `--model-weights-id` | `None` | Model variant ID (if multiple weight files exist) |
+| `--name` | `ProteInfer` | Name for the run |
+| `--annotations-path-name` | `GO_ANNOTATIONS_PATH` | Config key for annotations |
+| `--base-label-embedding-name` | `GO_BASE_LABEL_EMBEDDING_PATH` | Config key for label embeddings |
+| `--save-prediction-results` | off | Save predictions and ground truth |
+| `--only-inference` | off | Predict without computing metrics |
+| `--only-represented-labels` | off | Only predict labels represented in the dataset |
+| `--override` | `None` | Override config parameters as key-value pairs |
+
+### 5.4 BLAST Baseline
 
 Run sequence similarity baseline using BLAST:
 
 ```bash
 python bin/run_blast.py \
-    --test-paths-name TEST_DATA_PATH \
-    --num-threads 8
+    --test-data-path data/swissprot/proteinfer_splits/random/test_GO.fasta
 ```
 
-### 6.5 Batch Model Testing
+**Options:**
 
-Test multiple models across datasets using pre-defined test commands:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--test-data-path` | — | Path to the test FASTA file (required) |
+| `--train-data-path` | `TRAIN_DATA_PATH` from config | Path to the training FASTA (used as BLAST database) |
+| `--top-k-hits` | `1` | Number of top hits per query |
+| `--max-evalue` | `0.05` | E-value threshold (hits above this are dropped) |
+| `--cache` | off | Use cached results if available |
+| `--save-runtime-info` | off | Save search/parse duration to CSV |
+
+### 5.5 Batch Model Testing
+
+Test multiple models across pre-defined dataset configurations:
 
 ```bash
 python bin/test_models.py \
     --model-files model1.pt model2.pt \
-    --test-names GO_zero_shot GO_supervised
+    --test-paths-names TEST_DATA_PATH_ZERO_SHOT TEST_DATA_PATH
 ```
 
-### 6.6 Save Predictions
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model-files` | — | List of `.pt` model checkpoints to test (required) |
+| `--test-paths-names` | all defined tests | List of test path names (keys from `TEST_COMMANDS` dict) |
+| `--test-type` | `all` | What to run: `all`, `baseline`, or `model` |
+| `--save-prediction-results` | off | Save predictions for each test |
+| `--save-embeddings` | off | Save embeddings for each test |
+| `--save-val-test-metrics` | off | Append metrics to JSON file |
+| `--save-val-test-metrics-file` | `val_test_metrics.json` | JSON file for accumulated metrics |
+
+### 5.6 Save Predictions
 
 Predictions are saved as HDF5 files in `outputs/results/`:
 
@@ -563,9 +439,9 @@ Each file contains:
 
 ---
 
-## 7. Inference
+## 6. Inference
 
-### 7.1 Inference on New Proteins
+### 6.1 Inference on New Proteins
 
 To run inference on a custom FASTA file:
 
@@ -574,7 +450,7 @@ To run inference on a custom FASTA file:
    MY_CUSTOM_DATA: path/to/my_proteins.fasta
    ```
 
-2. If using the hybrid encoder, generate ESM-C embeddings and atom graphs for the new proteins (see Sections 3.6 and 3.7).
+2. If using the hybrid encoder, generate ESM-C embeddings and atom graphs for the new proteins (see [Data Preparation Guide](data_guide.md), Sections 9 and 10).
 
 3. Run inference:
    ```bash
@@ -585,7 +461,7 @@ To run inference on a custom FASTA file:
        run.name=custom_inference
    ```
 
-### 7.2 FASTA Format
+### 6.2 FASTA Format
 
 Input FASTA files should have GO/EC annotations in the header:
 
@@ -598,9 +474,9 @@ For inference-only (no ground truth), annotations in headers are optional.
 
 ---
 
-## 8. Advanced Topics
+## 7. Advanced Topics
 
-### 8.1 Model Architecture Overview
+### 7.1 Model Architecture Overview
 
 ToxinNote uses a two-tower architecture:
 
@@ -631,7 +507,7 @@ Structure + Sequence                   GO term description
                    sigmoid → probability
 ```
 
-### 8.2 Feature Fusion Options
+### 7.2 Feature Fusion Options
 
 | Method | Description |
 |--------|-------------|
@@ -640,7 +516,7 @@ Structure + Sequence                   GO term description
 | `concatenation_prod` | `[protein_emb, label_emb, protein_emb * label_emb]` → MLP |
 | `similarity` | Cosine similarity / temperature |
 
-### 8.3 Loss Functions
+### 7.3 Loss Functions
 
 | Loss | When to Use |
 |------|-------------|
@@ -650,13 +526,13 @@ Structure + Sequence                   GO term description
 | `CBLoss` | Class-balanced loss for long-tailed distributions |
 | `RGDBCE` | Reweighted gradient descent BCE |
 
-### 8.4 Data Augmentation
+### 7.4 Data Augmentation
 
 **Sequence augmentation** (`AUGMENT_RESIDUE_PROBABILITY=0.1`): Each residue has a 10% chance of being substituted according to BLOSUM62 substitution matrix probabilities. Only applied during training.
 
 **Label embedding noising** (`LABEL_EMBEDDING_NOISING_ALPHA=20.0`): Additive Gaussian noise is applied to label embeddings during training, scaled by `alpha / sqrt(embedding_dim)`. This regularizes the text encoder pathway.
 
-### 8.5 Interpretability
+### 7.5 Interpretability
 
 ToxinNote supports residue-level interpretability via Integrated Gradients:
 
@@ -671,7 +547,7 @@ python bin/main.py \
 
 This computes gradient-input attributions and can be trained jointly with a site ground truth MSE loss.
 
-### 8.6 Rapid Prototyping
+### 7.6 Rapid Prototyping
 
 Use subset fractions to train on smaller data for quick iteration:
 
@@ -685,7 +561,14 @@ python bin/main.py \
     run.name=quick_test
 ```
 
-### 8.7 Common Override Recipes
+### 7.7 Common Override Recipes
+
+**Enable dynamic batching by atom count (prevents OOM from large proteins):**
+```bash
+params.MAX_ATOMS_PER_BATCH=15000
+# Batch size varies per batch — small proteins get larger batches, large proteins get smaller ones
+# Requires atom-level mode with n_atoms in graph_index.json (produced by prepare_graph_data.py)
+```
 
 **Increase batch size with gradient accumulation (for limited GPU memory):**
 ```bash
