@@ -292,11 +292,19 @@ class ProtNote(nn.Module):
             raise ValueError("feature fusion method not implemented")
 
         # Reshape for loss
-        if self.training or self.inference_descriptions_per_label == 1:
+        # Only apply multi-description ensembling when we are in eval mode,
+        # have more than one description per label configured, and the total
+        # number of label embeddings is consistent with that configuration.
+        can_ensemble = (
+            (not self.training)
+            and (self.inference_descriptions_per_label > 1)
+            and (num_labels % self.inference_descriptions_per_label == 0)
+        )
+
+        if not can_ensemble:
             logits = logits.reshape(num_sequences, num_labels)
         else:
             # Get equivalent logit of averaging in probability space
-
             logits = torch.special.logit(
                 torch.sigmoid(logits)
                 .reshape(

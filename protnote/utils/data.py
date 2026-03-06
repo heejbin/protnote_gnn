@@ -14,6 +14,8 @@ import math
 import re
 from Bio.ExPASy import Enzyme
 import blosum as bl
+from queue import Queue
+from threading import Thread
 from typing import Union, List, Set, Literal
 import transformers
 from Bio.Seq import Seq
@@ -427,6 +429,43 @@ def get_ec_number_description(enzyme_dat_path: str, ec_classes: dict) -> list:
         if leaf_node["label"] == "":
             leaf_node["label"] = ec_classes[leaf_node["parent_code"]]["label"]
     return ec_leaf_nodes
+
+
+class ThreadPrefetchLoader:
+    """
+    Wraps a DataLoader and prefetches batches in a background thread (same process).
+    Use when num_workers=0 to avoid NCCL desync in multi-GPU, but still overlap
+    data loading with training. No subprocess spawn → no collective timeout.
+    """
+
+    def __init__(self, loader, buffer_size=2):
+        self.loader = loader
+        self.buffer_size = buffer_size
+        self.batch_sampler = getattr(loader, "batch_sampler", None)
+        self.sampler = getattr(loader, "sampler", None)
+        self.dataset = loader.dataset
+
+    def __len__(self):
+        return len(self.loader)
+
+    def __iter__(self):
+        queue = Queue(maxsize=self.buffer_size)
+
+        def worker():
+            try:
+                for batch in self.loader:
+                    queue.put(batch)
+            finally:
+                queue.put(None)
+
+        t = Thread(target=worker, daemon=True)
+        t.start()
+        while True:
+            batch = queue.get()
+            if batch is None:
+                break
+            yield batch
+        t.join()
 
 
 @contextlib.contextmanager

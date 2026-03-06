@@ -289,19 +289,19 @@ def sigmoid_bias_from_prob(prior_prob):
     return -np.log((1 - prior_prob) / prior_prob)
 
 
-def print_checkpoint(checkpoint):
+def print_checkpoint(checkpoint, verbose_optimizer=False):
     """
-    For debugging
+    For debugging. Set verbose_optimizer=True to print optimizer state (e.g. when resuming).
     """
+    print("epoch", checkpoint.get("epoch"))
+    print("best_val_metric", checkpoint.get("best_val_metric"))
+    if verbose_optimizer and "optimizer_state_dict" in checkpoint and checkpoint["optimizer_state_dict"].get("state"):
+        st = checkpoint["optimizer_state_dict"]["state"]
+        max_step = max(st.keys())
+        print("optimizer max step", st[max_step])
 
-    print("epoch", checkpoint["epoch"])
-    print("best_val_metric", checkpoint["best_val_metric"])
 
-    max_step = max(checkpoint["optimizer_state_dict"]["state"].keys())
-    print("optimizer max step", checkpoint["optimizer_state_dict"]["state"][max_step])
-
-
-def save_checkpoint(model, optimizer, epoch, best_val_metric, model_path):
+def save_checkpoint(model, optimizer, epoch, best_val_metric, model_path, scaler=None):
     """
     Save model and optimizer states as a checkpoint.
 
@@ -310,6 +310,7 @@ def save_checkpoint(model, optimizer, epoch, best_val_metric, model_path):
     - optimizer (torch.optim.Optimizer): The optimizer whose state we want to save.
     - epoch (int): The current training epoch.
     - model_path (str): The path where the checkpoint will be saved.
+    - scaler (torch.amp.GradScaler, optional): AMP GradScaler; if provided, its state is saved for resume.
     """
     checkpoint = {
         "epoch": epoch,
@@ -317,6 +318,8 @@ def save_checkpoint(model, optimizer, epoch, best_val_metric, model_path):
         "optimizer_state_dict": optimizer.state_dict(),
         "best_val_metric": best_val_metric,
     }
+    if scaler is not None:
+        checkpoint["grad_scaler_state_dict"] = scaler.state_dict()
 
     torch.save(checkpoint, model_path)
 
@@ -337,6 +340,8 @@ def load_model(trainer, checkpoint_path: str, rank: int, from_checkpoint=False):
 
     Note:
     The function assumes that the model in the trainer object is DDP-wrapped.
+    When from_checkpoint is True, optimizer and current model must have the same number of parameters
+    (same trainable params); otherwise AssertionError is raised.
     """
     torch.cuda.empty_cache()
 
@@ -344,7 +349,7 @@ def load_model(trainer, checkpoint_path: str, rank: int, from_checkpoint=False):
     map_location = {"cuda:%d" % 0: "cuda:%d" % rank}
     checkpoint = torch.load(checkpoint_path, map_location=map_location)
 
-    print_checkpoint(checkpoint)
+    print_checkpoint(checkpoint, verbose_optimizer=from_checkpoint)
 
     # Extract the state_dict from the checkpoint
     state_dict = checkpoint["model_state_dict"]
@@ -361,14 +366,46 @@ def load_model(trainer, checkpoint_path: str, rank: int, from_checkpoint=False):
     # Load the state_dict into the model
     trainer._get_model().load_state_dict(state_dict)
 
-    # Load the optimizer state and epoch number if they exist in the checkpoint
-    if "optimizer_state_dict" in checkpoint and from_checkpoint:
-        trainer.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    if "epoch" in checkpoint and from_checkpoint:
-        trainer.starting_epoch = checkpoint["epoch"]
-        trainer.epoch = trainer.starting_epoch
-    if "best_val_metric" in checkpoint and from_checkpoint:
-        trainer.best_val_metric = checkpoint["best_val_metric"]
+    # Always restore epoch so training continues from the next epoch (e.g. checkpoint epoch 5 -> start from 6).
+    if "epoch" in checkpoint:
+        checkpoint_epoch = checkpoint["epoch"]
+        trainer.starting_epoch = checkpoint_epoch + 1
+        trainer.epoch = checkpoint_epoch
 
-    # Delete the checkpoint to save memoryload_checkpoint[]
+    # Load the optimizer state and best-metric if requested.
+    if from_checkpoint:
+        if "optimizer_state_dict" in checkpoint:
+            import logging
+            log = getattr(trainer, "logger", logging.getLogger(__name__))
+            ckpt_opt = checkpoint["optimizer_state_dict"]
+            ckpt_state = ckpt_opt.get("state", {})
+            n_ckpt_params = len(ckpt_state)
+            n_current_params = sum(
+                len(pg["params"]) for pg in trainer.optimizer.param_groups
+            )
+            assert n_ckpt_params == n_current_params, (
+                f"Optimizer parameter count mismatch: checkpoint={n_ckpt_params}, current={n_current_params}. "
+                "Resume requires the same trainable parameters (e.g. same TRAIN_SEQUENCE_ENCODER, same frozen layers)."
+            )
+            trainer.optimizer.load_state_dict(ckpt_opt)
+            log.info("Loaded full optimizer state from checkpoint.")
+
+        if "best_val_metric" in checkpoint:
+            trainer.best_val_metric = checkpoint["best_val_metric"]
+
+        # Restore AMP GradScaler state so resume does not start with wrong scale (avoids NaN).
+        if hasattr(trainer, "scaler") and trainer.scaler is not None and "grad_scaler_state_dict" in checkpoint:
+            trainer.scaler.load_state_dict(checkpoint["grad_scaler_state_dict"])
+            if getattr(trainer, "logger", None):
+                trainer.logger.info("Loaded GradScaler state from checkpoint.")
+        elif hasattr(trainer, "scaler") and trainer.scaler is not None and from_checkpoint:
+            # Old checkpoint without scaler: keep AMP but use conservative initial scale to avoid NaN (no fp32 epoch).
+            from torch.amp import GradScaler
+            trainer.scaler = GradScaler("cuda", init_scale=2.0**8)
+            if getattr(trainer, "logger", None):
+                trainer.logger.info(
+                    "Checkpoint has no GradScaler state; using AMP with conservative initial scale (2^8) to avoid NaN."
+                )
+
+    # Delete the checkpoint to save memory.
     del checkpoint

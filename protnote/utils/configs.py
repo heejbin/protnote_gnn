@@ -46,13 +46,25 @@ def register_resolvers():
 def _get_data_root():
     if os.environ.get("AMLT_DATA_DIR"):
         return os.environ["AMLT_DATA_DIR"]
-    return os.path.join(str(get_project_root()), "data")
+    return _get_local_data_root()
 
 
 def _get_output_root():
     if os.environ.get("AMLT_OUTPUT_DIR"):
         return os.environ["AMLT_OUTPUT_DIR"]
     return os.path.join(str(get_project_root()), "outputs")
+
+
+def _get_local_data_root():
+    """Determine local (non-AMLT) data root when config is not available (e.g. resolvers).
+
+    Preference: LOCAL_DATA_ROOT env var, else <project_root>/data.
+    When config is available, use get_setup() which also considers structural_optuna.data_root.
+    """
+    env_data_dir = os.environ.get("LOCAL_DATA_ROOT")
+    if env_data_dir:
+        return env_data_dir
+    return os.path.join(str(get_project_root()), "data")
 
 
 def generate_label_embedding_path(params: dict, base_label_embedding_path: str):
@@ -163,7 +175,7 @@ def _setup_logging(paths: dict, run_name: str, is_master: bool):
         except FileExistsError:
             print(f"Log directory {log_dir} already exists. is_master={is_master}")
             pass
-    full_log_path = os.path.join(log_dir, f"{timestamp}_{run_name}.log")
+    full_log_path = os.path.join(log_dir, f"{timestamp}_{run_name}.txt")
 
     logger = logging.getLogger()
 
@@ -210,7 +222,13 @@ def get_setup(
     else:
         ROOT_PATH = str(get_project_root())
         print(ROOT_PATH)
-        DATA_PATH = os.path.join(ROOT_PATH, "data")
+        # 1) env 2) config structural_optuna.data_root 3) project data
+        data_root_from_config = getattr(getattr(cfg, "structural_optuna", None), "data_root", None)
+        DATA_PATH = (
+            os.environ.get("LOCAL_DATA_ROOT")
+            or (data_root_from_config if data_root_from_config else None)
+            or _get_local_data_root()
+        )
         OUTPUT_PATH = os.path.join(ROOT_PATH, "outputs")
         if not os.path.exists(OUTPUT_PATH) and is_master:
             os.makedirs(OUTPUT_PATH)

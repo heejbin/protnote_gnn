@@ -2,6 +2,8 @@ from typing import List, Tuple
 
 import torch
 
+from protnote.data.samplers import PADDING_SEQUENCE_ID
+
 try:
     from torch_geometric.data import Batch as PyGBatch
 except ImportError:
@@ -30,13 +32,14 @@ def collate_structure_batch(
         Input items have 'atom_coords', 'atom_types', 'esmc_embeddings', etc.
         Returns dict with batched tensors + 'graph_data' dict for encoder
     """
+    is_padding = all(item.get("sequence_id") == PADDING_SEQUENCE_ID for item in batch)
     # Detect format based on first item
     if "structure_batch" in batch[0]:
-        return _collate_legacy(
+        result = _collate_legacy(
             batch, label_sample_size, distribute_labels, shuffle_labels, in_batch_sampling, grid_sampler, world_size, rank
         )
     else:
-        return _collate_atom_level(
+        result = _collate_atom_level(
             batch,
             label_sample_size,
             distribute_labels,
@@ -47,6 +50,9 @@ def collate_structure_batch(
             rank,
             return_label_multihots,
         )
+    result["is_padding"] = is_padding
+    result["is_single_protein_batch"] = len(batch) == 1 and not is_padding
+    return result
 
 
 def _collate_legacy(
@@ -268,6 +274,7 @@ def collate_variable_sequence_length(
               - 'label_token_counts': Tensor, token counts for each label.
 
     """
+    is_padding = all(item.get("sequence_id") == PADDING_SEQUENCE_ID for item in batch)
 
     # Determine the maximum sequence length in the batch
     max_length = max(item["sequence_length"] for item in batch)
@@ -358,6 +365,8 @@ def collate_variable_sequence_length(
         "sequence_lengths": torch.stack(processed_sequence_lengths),
         "label_embeddings": processed_label_embeddings,
         "label_token_counts": label_token_counts,
+        "is_padding": is_padding,
+        "is_single_protein_batch": len(batch) == 1 and not is_padding,
     }
 
     if return_label_multihots:

@@ -16,17 +16,18 @@ from protnote.utils.losses import (
 from torchmetrics import MetricCollection, Metric
 from protnote.utils.proteinfer import normalize_confidences
 import torch.distributed as dist
+import time
 import numpy as np
 import torch
-import wandb
 import os
 import pickle
 import shutil
 import json
 from collections import defaultdict
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.nn.utils import clip_grad_norm_
 from transformers import BatchEncoding
+from tqdm.auto import tqdm
 from protnote.utils.models import biogpt_train_last_n_layers, save_checkpoint, load_model
 from protnote.utils.interpretability import (
     load_site_ground_truth_tsv,
@@ -103,6 +104,7 @@ class ProtNoteTrainer:
         use_amlt: bool = False,
         is_master: bool = True,
         starting_epoch: int = 1,
+        cpu_metric_process_group=None,
     ):
         """
         Args:
@@ -124,7 +126,7 @@ class ProtNoteTrainer:
         self.run_name = run_name
         self.logger = logger
         self.timestamp = timestamp
-        self.use_wandb = use_wandb
+        self.use_wandb = False
         self.use_amlt = use_amlt
         self.loss_fn = loss_fn
         self.best_val_metric = 0.0  # WARNING: Assumes higher is better
@@ -177,11 +179,13 @@ class ProtNoteTrainer:
             opt_name=config["params"]["OPTIMIZER"], lr=config["params"]["LEARNING_RATE"]
         )
 
-        self.scaler = GradScaler()
+        # Use new torch.amp GradScaler API for CUDA
+        self.scaler = GradScaler("cuda")
         self.base_model_path = self._get_saved_model_base_path()
         self.model_path_best_metric = self.base_model_path + f"_best_val_metric.pt"
         self.model_path_best_loss = self.base_model_path + f"_best_val_loss.pt"
         self.model_path_last_epoch = self.base_model_path + f"_last_epoch.pt"
+        self.cpu_metric_process_group = cpu_metric_process_group
 
         # self.tb = SummaryWriter(f"runs/{self.run_name}_{self.timestamp}") if self.is_master else None
 
@@ -196,21 +200,23 @@ class ProtNoteTrainer:
         )
         return model_path
 
-    def _to_device(self, *args):
+    def _to_device(self, *args, non_blocking=False):
+        # non_blocking=True on CUDA overlaps CPU->GPU copy with previous GPU work
+        pin = non_blocking and self.device.type == "cuda"
         processed_args = []
         for item in args:
             if item is None:
                 processed_args.append(item)
             elif isinstance(item, torch.Tensor):
-                processed_args.append(item.to(self.device))
+                processed_args.append(item.to(self.device, non_blocking=pin))
             elif isinstance(item, BatchEncoding) or isinstance(item, dict):
                 processed_dict = {
-                    k: v.to(self.device) if isinstance(v, torch.Tensor) else v
+                    k: v.to(self.device, non_blocking=pin) if isinstance(v, torch.Tensor) else v
                     for k, v in item.items()
                 }
                 processed_args.append(processed_dict)
             elif hasattr(item, "to"):  # PyG Batch
-                processed_args.append(item.to(self.device))
+                processed_args.append(item.to(self.device, non_blocking=pin))
             else:
                 processed_args.append(item)
         return processed_args
@@ -330,7 +336,7 @@ class ProtNoteTrainer:
             }
 
         # Forward pass
-        with autocast():
+        with autocast("cuda"):
             logits, embeddings = self.model(**inputs, save_embeddings=return_embeddings)
             loss = self.loss_fn(logits, label_multihots.float())
 
@@ -363,13 +369,7 @@ class ProtNoteTrainer:
             log_gpu_memory_usage(self.logger, 0)
         self.logger.info(f"Validation metrics:\n{json.dumps(val_metrics, indent=4)}")
 
-        if self.use_wandb and self.is_master:
-            try:
-                if self.use_wandb and self.is_master:
-                    wandb.log(val_metrics, step=self.training_step)
-
-            except Exception as e:
-                self.logger.warning(f"Failed to log validation metrics to wandb: {e}")
+        # W&B logging disabled
 
         # Save the model if it has the best validation **metric** so far (only on master node)
         if (
@@ -387,13 +387,11 @@ class ProtNoteTrainer:
                 epoch=self.epoch,
                 best_val_metric=self.best_val_metric,
                 model_path=self.model_path_best_metric,
+                scaler=self.scaler,
             )
             self.logger.info(f"Saved model to {self.model_path_best_metric}")
 
-            if self.use_wandb:
-                wandb.save(
-                    f"{self.timestamp}_best_{val_optimization_metric_name}_ProtNote.pt"
-                )
+            # W&B artifact saving disabled
 
         # Save the model if it has the best validation **loss** so far (only on master node)
         if self.is_master and val_metrics[f"{prefix}_loss"] < self.best_val_loss:
@@ -408,11 +406,15 @@ class ProtNoteTrainer:
                 epoch=self.epoch,
                 best_val_metric=self.best_val_loss,
                 model_path=self.model_path_best_loss,
+                scaler=self.scaler,
             )
             self.logger.info(f"Saved model to {self.model_path_best_loss}")
 
-            if self.use_wandb:
-                wandb.save(f"{self.timestamp}_best_loss_ProtNote.pt")
+            # W&B artifact saving disabled
+
+        # Barrier so non-master ranks wait for master to finish saving before next epoch
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
 
         self.logger.info(
             "+------------------------------------------------------------------------------------+"
@@ -524,14 +526,16 @@ class ProtNoteTrainer:
         if eval_metrics is not None:
             eval_metrics.reset()
 
+        # Keep mAP metrics on CPU so 801-batch validation does not OOM (torcheval accumulates all targets/scores; compute() does torch.cat on device).
+        cpu_device = torch.device("cpu")
         if self.config["params"]["ESTIMATE_MAP"] == False:
-            mAP_micro = BinaryAUPRC(device="cpu")
-            mAP_macro = MultilabelAUPRC(device="cpu", num_labels=num_labels)
+            mAP_micro = BinaryAUPRC(device=cpu_device)
+            mAP_macro = MultilabelAUPRC(device=cpu_device, num_labels=num_labels)
 
         elif self.config["params"]["ESTIMATE_MAP"] == True:
-            mAP_micro = BinaryBinnedAUPRC(device=self.device, threshold=50)
+            mAP_micro = BinaryBinnedAUPRC(device=cpu_device, threshold=50)
             mAP_macro = MultilabelBinnedAUPRC(
-                device=self.device, num_labels=num_labels, threshold=50
+                device=cpu_device, num_labels=num_labels, threshold=50
             )
 
         elif self.config["params"]["ESTIMATE_MAP"] is None:
@@ -549,20 +553,37 @@ class ProtNoteTrainer:
             "sequence_ids": [],
         }
         embeddings_num_batches = 100  # The number of embedding batches to export at a time if return_embedding = True
-        embeddings_export_dir = os.path.join(
+        embeddings_root_dir = os.path.join(
             self.config["paths"]["RESULTS_DIR"],
             f"{data_loader_name}_embeddings_{self.run_name}",
         )
+        embeddings_export_dir = os.path.join(embeddings_root_dir, f"rank_{self.rank}")
         if return_embeddings:
-            if os.path.exists(embeddings_export_dir):
-                shutil.rmtree(embeddings_export_dir)
-            os.mkdir(embeddings_export_dir)
+            if dist.is_available() and dist.is_initialized():
+                # Avoid cross-rank races by having rank0 reset the root dir,
+                # then each rank writes into its own subdirectory.
+                if self.is_master and os.path.exists(embeddings_root_dir):
+                    shutil.rmtree(embeddings_root_dir)
+                dist.barrier()
+                os.makedirs(embeddings_export_dir, exist_ok=True)
+                dist.barrier()
+            else:
+                if os.path.exists(embeddings_root_dir):
+                    shutil.rmtree(embeddings_root_dir)
+                os.makedirs(embeddings_export_dir, exist_ok=True)
 
         with torch.no_grad():
             for batch_idx, batch in enumerate(data_loader):
+                if dist.is_available() and dist.is_initialized():
+                    dist.barrier()
+                is_dummy = batch.get("is_padding") is True or batch.get("is_single_protein_batch") is True
+
                 loss, logits, labels, sequence_ids, embeddings = self.evaluation_step(
                     batch=batch, return_embeddings=return_embeddings
                 )
+                if is_dummy:
+                    continue
+
                 if only_represented_labels:
                     logits = logits[:, data_loader.dataset.represented_vocabulary_mask]
                     labels = labels[:, data_loader.dataset.represented_vocabulary_mask]
@@ -700,9 +721,16 @@ class ProtNoteTrainer:
 
             final_metrics = eval_metrics.compute() if eval_metrics is not None else {}
 
-            global_mAP_micro = sync_and_compute(mAP_micro)
-            global_avg_loss = sync_and_compute(avg_loss)
-            global_mAP_macro = sync_and_compute(mAP_macro)
+            if dist.is_available() and dist.is_initialized():
+                # Use GLOO group for CPU mAP metrics so sync stays on CPU (no slow CPU→GPU copy).
+                pg_cpu = getattr(self, "cpu_metric_process_group", None)
+                global_mAP_micro = sync_and_compute(mAP_micro, process_group=pg_cpu)
+                global_avg_loss = sync_and_compute(avg_loss)
+                global_mAP_macro = sync_and_compute(mAP_macro, process_group=pg_cpu)
+            else:
+                global_mAP_micro = mAP_micro.compute() if mAP_micro is not None else None
+                global_avg_loss = avg_loss.compute()
+                global_mAP_macro = mAP_macro.compute() if mAP_macro is not None else None
 
             final_metrics.update(
                 {
@@ -733,8 +761,31 @@ class ProtNoteTrainer:
         eval_metrics.reset()
 
         ####### TRAINING LOOP #######
-        for batch_idx, batch in enumerate(train_loader):
+        iterator = (
+            tqdm(
+                train_loader,
+                desc=f"Train epoch {self.epoch}",
+                total=len(train_loader),
+                leave=False,
+            )
+            if self.is_master
+            else train_loader
+        )
+
+        t_prev_end = None
+        for batch_idx, batch in enumerate(iterator):
+            # Sync after loading so no rank enters forward/collective while another is still in DataLoader (avoids NCCL timeout with num_workers>0).
+            if dist.is_available() and dist.is_initialized():
+                dist.barrier()
+
+            t_step_start = time.perf_counter()
+            data_load_sec = (t_step_start - t_prev_end) if t_prev_end is not None else 0.0
+
             self.training_step += 1
+
+            # Padding/single-protein: still run forward+backward so all ranks participate in DDP collectives.
+            # Use dummy loss (0) to avoid affecting training.
+            is_dummy_step = batch.get("is_padding") is True or batch.get("is_single_protein_batch") is True
 
             # Unpack the training batch (atom-level, structural, or sequence mode)
             if "graph_data" in batch:
@@ -744,10 +795,11 @@ class ProtNoteTrainer:
                 label_multihots = batch["label_multihots"]
                 label_embeddings = batch["label_embeddings"]
                 label_token_counts = batch["label_token_counts"]
-                # Move graph_data tensors to device
-                graph_data = {k: v.to(self.device) if hasattr(v, 'to') else v for k, v in graph_data.items()}
+                # Move graph_data tensors to device (non_blocking overlaps with previous step)
+                pin = self.device.type == "cuda"
+                graph_data = {k: v.to(self.device, non_blocking=pin) if hasattr(v, 'to') else v for k, v in graph_data.items()}
                 label_multihots, label_embeddings, label_token_counts = self._to_device(
-                    label_multihots, label_embeddings, label_token_counts
+                    label_multihots, label_embeddings, label_token_counts, non_blocking=True
                 )
                 inputs = {
                     "graph_data": graph_data,
@@ -761,7 +813,7 @@ class ProtNoteTrainer:
                 label_embeddings = batch["label_embeddings"]
                 label_token_counts = batch["label_token_counts"]
                 structure_batch, label_multihots, label_embeddings, label_token_counts = self._to_device(
-                    structure_batch, label_multihots, label_embeddings, label_token_counts
+                    structure_batch, label_multihots, label_embeddings, label_token_counts, non_blocking=True
                 )
                 if self._site_ground_truth is not None and getattr(structure_batch, "plm", None) is not None:
                     structure_batch.plm.requires_grad_(True)
@@ -796,6 +848,7 @@ class ProtNoteTrainer:
                     label_multihots,
                     label_embeddings,
                     label_token_counts,
+                    non_blocking=True,
                 )
                 inputs = {
                     "sequence_onehots": sequence_onehots,
@@ -804,19 +857,27 @@ class ProtNoteTrainer:
                     "label_token_counts": label_token_counts,
                 }
 
+            # Dummy step: inner module to eval so BatchNorm accepts batch size 1 (DDP.module)
+            if is_dummy_step:
+                self._get_model().eval()
+
             # Forward pass
-            with autocast():
+            with autocast("cuda"):
                 logits, _ = self.model(**inputs)
 
-                # Compute loss, normalized by the number of gradient accumulation steps
-                loss = (
-                    self.loss_fn(logits, label_multihots.float())
-                    / self.gradient_accumulation_steps
-                )
+                # Compute loss (dummy 0 for padding/single-protein so all ranks still run backward/collectives)
+                if is_dummy_step:
+                    loss = 0.0 * logits.sum() / self.gradient_accumulation_steps
+                else:
+                    loss = (
+                        self.loss_fn(logits, label_multihots.float())
+                        / self.gradient_accumulation_steps
+                    )
 
                 # Interpretability loss (IntegratedGradient): MSE between gradient-input attribution and site ground truth
                 if (
-                    self.use_structural_encoder
+                    not is_dummy_step
+                    and self.use_structural_encoder
                     and self._site_ground_truth is not None
                     and self.interpretability_method == "integratedgradient"
                     and getattr(structure_batch, "plm", None) is not None
@@ -855,26 +916,29 @@ class ProtNoteTrainer:
                 self.scaler.update()
                 self.optimizer.zero_grad()
 
-            avg_loss.update(loss.detach())
+            if is_dummy_step:
+                self._get_model().train()
 
-            eval_metrics(
-                logits.detach(), label_multihots.detach()
-            )  # detaching labels is not "necessary" because they don't retain the graph
-            tp, fn, fp = calculate_tp_fn_fp(
-                probs=torch.sigmoid(logits.detach()),
-                labels=label_multihots.detach(),
-                threshold=self.config["params"]["DECISION_TH"],
-            )
-
-            total_tp_per_label += tp
-            total_fn_per_label += fn
-            total_fp_per_label += fp
-
-            if self.use_wandb and self.is_master:
-                wandb.log(
-                    {"per_batch_train_loss": loss.item()},  # .item() is detached
-                    step=self.training_step,
+            if not is_dummy_step:
+                avg_loss.update(loss.detach())
+                eval_metrics(
+                    logits.detach(), label_multihots.detach()
+                )  # detaching labels is not "necessary" because they don't retain the graph
+                tp, fn, fp = calculate_tp_fn_fp(
+                    probs=torch.sigmoid(logits.detach()),
+                    labels=label_multihots.detach(),
+                    threshold=self.config["params"]["DECISION_TH"],
                 )
+                total_tp_per_label += tp
+                total_fn_per_label += fn
+                total_fp_per_label += fp
+                if self.is_master:
+                    iterator.set_postfix(
+                        loss=f"{avg_loss.compute().item():.6f}",
+                        refresh=True,
+                    )
+
+            # W&B per-batch logging disabled
 
             # Print memory consumption after first batch (to get the max memory consumption during training)
             if batch_idx == 1 and self.is_master:
@@ -886,16 +950,30 @@ class ProtNoteTrainer:
                     "+----------------------------------------------------------+"
                 )
 
-            # Print progress every 10%
-            if batch_idx % (len(train_loader) // 10) == 0:
+            # Print progress every ~10% (avoid ZeroDivisionError when len(train_loader) < 10)
+            progress_interval = max(1, len(train_loader) // 10)
+            if batch_idx % progress_interval == 0:
                 self.logger.info(
                     f"[Train] Epoch {self.epoch}: Processed {batch_idx} out of {len(train_loader)} batches ({batch_idx / len(train_loader) * 100:.2f}%)."
                 )
 
-        # Aggregate the TP, FN, FP across all GPUs
-        dist.reduce(total_tp_per_label, dst=0, op=dist.ReduceOp.SUM)
-        dist.reduce(total_fn_per_label, dst=0, op=dist.ReduceOp.SUM)
-        dist.reduce(total_fp_per_label, dst=0, op=dist.ReduceOp.SUM)
+            # Timing: data load vs step (to see if GPU is waiting on dataloader)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+            t_prev_end = time.perf_counter()
+            step_sec = t_prev_end - t_step_start
+            if self.is_master and batch_idx > 0 and batch_idx % 50 == 0:
+                load_pct = (100.0 * data_load_sec / step_sec) if step_sec > 0 else 0.0
+                # Newline so this log does not overwrite tqdm progress bar (loss=0.0019 → loss=0)
+                self.logger.info(
+                    f"\n[Timing] batch {batch_idx} data_load={data_load_sec:.3f}s step={step_sec:.3f}s load_pct={load_pct:.1f}%"
+                )
+
+        # Aggregate the TP, FN, FP across all GPUs (only when distributed)
+        if dist.is_available() and dist.is_initialized():
+            dist.reduce(total_tp_per_label, dst=0, op=dist.ReduceOp.SUM)
+            dist.reduce(total_fn_per_label, dst=0, op=dist.ReduceOp.SUM)
+            dist.reduce(total_fp_per_label, dst=0, op=dist.ReduceOp.SUM)
 
         global_f1_scores_per_label = calculate_f1(
             tp=total_tp_per_label, fn=total_fn_per_label, fp=total_fp_per_label
@@ -907,9 +985,16 @@ class ProtNoteTrainer:
             total_fn_per_label=total_fn_per_label,
             total_fp_per_label=total_fp_per_label,
         )
-        global_avg_train_loss = sync_and_compute(avg_loss)
+        if dist.is_available() and dist.is_initialized():
+            global_avg_train_loss = sync_and_compute(avg_loss)
+        else:
+            global_avg_train_loss = avg_loss.compute()
 
-        train_metrics = eval_metrics.compute() if eval_metrics is not None else {}
+        # In distributed, skip MetricCollection.compute() to avoid sync overflow when ranks have different batch counts
+        if eval_metrics is not None and not (dist.is_available() and dist.is_initialized()):
+            train_metrics = eval_metrics.compute()
+        else:
+            train_metrics = {}
         train_metrics.update(
             {
                 "loss": global_avg_train_loss,
@@ -920,8 +1005,7 @@ class ProtNoteTrainer:
 
         train_metrics = metric_collection_to_dict_float(train_metrics, prefix="train")
 
-        if self.use_wandb and self.is_master:
-            wandb.log(train_metrics, step=self.training_step)
+        # W&B epoch-level logging disabled
 
         return train_metrics
 
@@ -944,9 +1028,7 @@ class ProtNoteTrainer:
         """
         self.model.train()
 
-        # Watch the model
-        if self.use_wandb:
-            wandb.watch(self.model)
+        # W&B model watching disabled
 
         # Compute total number of training steps
         self.training_step = 0
@@ -1000,13 +1082,13 @@ class ProtNoteTrainer:
                         epoch=self.epoch,
                         best_val_metric=self.best_val_metric,
                         model_path=self.model_path_last_epoch,
+                        scaler=self.scaler,
                     )
                     self.logger.info(f"Saved model to {self.model_path_last_epoch}")
 
-                    if self.use_wandb:
-                        wandb.save(f"{self.timestamp}_last_epoch_ProtNote.pt")
+                    # W&B artifact saving disabled
 
-                if epoch % 10 == 0:
+                if epoch % 5 == 0:
                     self.logger.info(f"Saving checkpoint from epoch {epoch}...")
                     epoch_model_path = self.base_model_path + f"_epoch_{epoch}.pt"
                     save_checkpoint(
@@ -1015,21 +1097,38 @@ class ProtNoteTrainer:
                         epoch=self.epoch,
                         best_val_metric=self.best_val_metric,
                         model_path=epoch_model_path,
+                        scaler=self.scaler,
                     )
                     self.logger.info(f"Saved model to {epoch_model_path}")
 
-                    if self.use_wandb:
-                        wandb.save(f"{self.timestamp}_last_epoch_ProtNote.pt")
+                    # W&B artifact saving disabled
 
         if self.is_master:
-            self.logger.info(
-                f"Restoring model to best validation {val_optimization_metric_name}..."
-            )
-            load_model(
-                trainer=self,
-                rank=self.rank,
-                checkpoint_path=self.model_path_best_metric,
-            )
+            # Prefer best-metric checkpoint; if missing, fall back to last-epoch.
+            checkpoint_to_load = None
+            if os.path.exists(self.model_path_best_metric):
+                checkpoint_to_load = self.model_path_best_metric
+                self.logger.info(
+                    f"Restoring model to best validation {val_optimization_metric_name} from {checkpoint_to_load}..."
+                )
+            elif os.path.exists(self.model_path_last_epoch):
+                checkpoint_to_load = self.model_path_last_epoch
+                self.logger.warning(
+                    f"Best-metric checkpoint {self.model_path_best_metric} not found. "
+                    f"Falling back to last-epoch checkpoint {checkpoint_to_load}."
+                )
+            else:
+                self.logger.warning(
+                    f"No best-metric ({self.model_path_best_metric}) or last-epoch "
+                    f"({self.model_path_last_epoch}) checkpoint found. Keeping current model weights."
+                )
+
+            if checkpoint_to_load is not None:
+                load_model(
+                    trainer=self,
+                    rank=self.rank,
+                    checkpoint_path=checkpoint_to_load,
+                )
 
             # Broadcast model state to other processes
             for param in self._get_model().parameters():

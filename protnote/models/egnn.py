@@ -202,9 +202,12 @@ class StructuralProteinEncoder(nn.Module):
             ]
         )
         # Map pooled hidden_nf -> protein_embedding_dim (e.g. 1100 for ProtNote W_p)
+        # Use LayerNorm instead of BatchNorm: DynamicBatchSampler can yield batches with
+        # num_proteins=1 (e.g. when a single protein exceeds MAX_ATOMS_PER_BATCH), and
+        # BatchNorm1d requires batch size > 1 during training.
         self.projection = nn.Sequential(
             nn.Linear(hidden_nf, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.LeakyReLU(),
             nn.Linear(256, protein_embedding_dim),
         )

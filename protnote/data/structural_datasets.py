@@ -159,7 +159,9 @@ class ProteinStructureDataset(Dataset):
         # Label embeddings (same as ProteinDataset)
         INDEX_OUTPUT_PATH = config["LABEL_EMBEDDING_PATH"].split(".")
         INDEX_OUTPUT_PATH = "_".join([INDEX_OUTPUT_PATH[0], "index"]) + "." + INDEX_OUTPUT_PATH[1]
-        index_mapping = torch.load(INDEX_OUTPUT_PATH)
+        # Index mapping contains a pandas DataFrame, so disable weights_only
+        # to allow loading non-tensor objects with PyTorch >= 2.6.
+        index_mapping = torch.load(INDEX_OUTPUT_PATH, weights_only=False)
         emb_tensor = torch.load(config["LABEL_EMBEDDING_PATH"])
         (
             self.label_embeddings_index,
@@ -193,7 +195,9 @@ class ProteinStructureDataset(Dataset):
 
         # Then try individual file
         if sequence_id in self.graph_index:
-            graph_path = os.path.join(self.graph_dir, self.graph_index[sequence_id]["filename"])
+            entry = self.graph_index[sequence_id]
+            fname = entry["filename"] if isinstance(entry, dict) else entry
+            graph_path = os.path.join(self.graph_dir, fname)
             try:
                 graph_data = torch.load(graph_path, weights_only=False)
                 return graph_data
@@ -292,10 +296,28 @@ class ProteinStructureDataset(Dataset):
         )
 
     def get_atom_counts(self):
-        """Return an array of atom counts aligned with dataset indices."""
+        """Return an array of atom counts aligned with dataset indices.
+        graph_index may be seq_id -> {"filename": ..., "n_atoms": N} or seq_id -> "filename.pt".
+        """
         counts = np.empty(len(self.data), dtype=np.int64)
-        for i, (_sequence, seq_id, _labels) in enumerate(self.data):
-            counts[i] = self.graph_index[seq_id]["n_atoms"]
+        for i, (sequence, seq_id, _labels) in enumerate(self.data):
+            entry = self.graph_index[seq_id]
+            if isinstance(entry, dict) and "n_atoms" in entry:
+                counts[i] = entry["n_atoms"]
+            elif isinstance(entry, dict) and "filename" in entry:
+                path = os.path.join(self.graph_dir, entry["filename"])
+                try:
+                    g = torch.load(path, weights_only=False)
+                    counts[i] = g.get("n_atoms", g.get("num_atoms", len(sequence) * 4))
+                except Exception:
+                    counts[i] = len(sequence) * 4
+            else:
+                path = os.path.join(self.graph_dir, entry)
+                try:
+                    g = torch.load(path, weights_only=False)
+                    counts[i] = g.get("n_atoms", g.get("num_atoms", len(sequence) * 4))
+                except Exception:
+                    counts[i] = len(sequence) * 4
         return counts
 
     def __len__(self):
@@ -325,6 +347,8 @@ class ProteinStructureDataset(Dataset):
         return torch.tensor(num_neg / max(num_pos, 1e-6), dtype=torch.float32)
 
     def __getitem__(self, idx):
+        if idx >= len(self.data):
+            return self._get_padding_sample()
         sequence, sequence_id, labels = self.data[idx]
 
         labels_ints = [self.label2int[label] for label in labels]
@@ -403,6 +427,27 @@ class ProteinStructureDataset(Dataset):
             "label_token_counts": label_token_counts,
         }
 
+    def _get_padding_sample(self):
+        """Dummy sample for padding batches (loss=0, no gradient)."""
+        from protnote.data.samplers import PADDING_SEQUENCE_ID
+
+        esmc_dim = 960  # ESM-C default
+        return {
+            "atom_coords": torch.zeros(1, 3, dtype=torch.float32),
+            "atom_types": torch.zeros(1, dtype=torch.long),
+            "atom_to_residue": torch.zeros(1, dtype=torch.long),
+            "esmc_embeddings": torch.zeros(1, esmc_dim, dtype=torch.float32),
+            "edge_index": torch.zeros(2, 0, dtype=torch.long),
+            "num_residues": 1,
+            "num_atoms": 1,
+            "residue_indices": torch.zeros(1, dtype=torch.long),
+            "sequence_id": PADDING_SEQUENCE_ID,
+            "sequence_str": "",
+            "label_multihots": torch.zeros(len(self.label_vocabulary), dtype=torch.float32),
+            "label_embeddings": self.sorted_label_embeddings,
+            "label_token_counts": self.sorted_label_token_counts,
+        }
+
 
 def create_structural_loaders(
     datasets: dict,
@@ -423,7 +468,11 @@ def create_structural_loaders(
     from torch.utils.data import DataLoader
 
     from protnote.data.collators import collate_structure_batch
-    from protnote.data.samplers import DynamicBatchSampler, observation_sampler_factory
+    from protnote.data.samplers import (
+        DynamicBatchSampler,
+        PaddedDynamicBatchSampler,
+        observation_sampler_factory,
+    )
 
     max_atoms = params.get("MAX_ATOMS_PER_BATCH")
 
@@ -458,11 +507,20 @@ def create_structural_loaders(
             )
             if use_dynamic:
                 atom_counts = dataset.get_atom_counts()
-                batch_sampler = DynamicBatchSampler(
+                base_batch_sampler = DynamicBatchSampler(
                     element_sampler=sequence_sampler,
                     atom_counts=atom_counts,
                     max_atoms_per_batch=max_atoms,
                     drop_last=(dataset_type == "train"),
+                    world_size=world_size,
+                    rank=rank,
+                    max_elements_per_batch=batch_size_for_type,
+                )
+                batch_sampler = PaddedDynamicBatchSampler(
+                    base_batch_sampler=base_batch_sampler,
+                    dataset_len=len(dataset),
+                    world_size=world_size,
+                    rank=rank,
                 )
                 loader = DataLoader(
                     dataset,
@@ -470,6 +528,7 @@ def create_structural_loaders(
                     collate_fn=collate_fn,
                     num_workers=num_workers,
                     pin_memory=pin_memory,
+                    persistent_workers=num_workers > 0,  # Avoid last-batch delay from worker cleanup
                 )
             else:
                 loader = DataLoader(
@@ -481,6 +540,7 @@ def create_structural_loaders(
                     pin_memory=pin_memory,
                     drop_last=(dataset_type == "train"),
                     sampler=sequence_sampler,
+                    persistent_workers=num_workers > 0,  # Avoid last-batch delay from worker cleanup
                 )
             loaders[dataset_type].append(loader)
     return loaders

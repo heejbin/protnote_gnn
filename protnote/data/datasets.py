@@ -12,7 +12,13 @@ import blosum as bl
 from torch.utils.data import Dataset, DataLoader
 from protnote.data.collators import collate_variable_sequence_length
 from protnote.utils.data import read_fasta, get_vocab_mappings, save_to_fasta
-from protnote.data.samplers import GridBatchSampler, observation_sampler_factory
+from protnote.data.samplers import (
+    DynamicBatchSampler,
+    GridBatchSampler,
+    PaddedDynamicBatchSampler,
+    observation_sampler_factory,
+    PADDING_SEQUENCE_ID,
+)
 from protnote.utils.data import generate_vocabularies
 
 
@@ -116,7 +122,9 @@ class ProteinDataset(Dataset):
         INDEX_OUTPUT_PATH = (
             "_".join([INDEX_OUTPUT_PATH[0], "index"]) + "." + INDEX_OUTPUT_PATH[1]
         )
-        index_mapping = torch.load(INDEX_OUTPUT_PATH)
+        # Index mapping file stores a pandas DataFrame, so we must disable
+        # weights_only to load non-tensor objects with PyTorch >= 2.6.
+        index_mapping = torch.load(INDEX_OUTPUT_PATH, weights_only=False)
         (
             self.label_embeddings_index,
             self.label_embeddings,
@@ -213,6 +221,15 @@ class ProteinDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.data)
+
+    def get_atom_counts(self):
+        """Return an array of sequence lengths (residue counts) aligned with dataset indices.
+        Used for dynamic batching by total residues per batch (same param MAX_ATOMS_PER_BATCH as structure path).
+        """
+        counts = np.empty(len(self.data), dtype=np.int64)
+        for i, (sequence, _seq_id, _labels) in enumerate(self.data):
+            counts[i] = len(sequence)
+        return counts
 
     def _sample_based_on_blosum62(self, amino_acid: str) -> str:
         """
@@ -409,6 +426,8 @@ class ProteinDataset(Dataset):
         }
 
     def __getitem__(self, idx) -> tuple:
+        if idx >= len(self.data):
+            return self._get_padding_sample()
         if self.require_label_idxs:
             # For Grid sampler, idx is a tuple of (sequence_idx, label_idxs)
             sequence_idx, label_idxs = idx[0], idx[1]
@@ -421,6 +440,20 @@ class ProteinDataset(Dataset):
             sequence, sequence_id, labels = self.data[idx]  # We throw away sequence_id
 
         return self.process_example(sequence, sequence_id, labels, label_idxs)
+
+    def _get_padding_sample(self):
+        """Dummy sample for padding batches (loss=0, no gradient)."""
+        n_aa = len(self.amino_acid_vocabulary)
+        n_labels = len(self.label_vocabulary)
+        return {
+            "sequence_onehots": torch.zeros(n_aa, 1, dtype=torch.float32),
+            "sequence_id": PADDING_SEQUENCE_ID,
+            "sequence_length": torch.tensor(1, dtype=torch.long),
+            "label_multihots": torch.zeros(n_labels, dtype=torch.float32),
+            "label_embeddings": self.sorted_label_embeddings,
+            "label_idxs": None,
+            "label_token_counts": self.sorted_label_token_counts,
+        }
 
     def calculate_pos_weight(self):
         # TODO: UPDATE THIS CODE TO LEVERAGE LABEL FREQUENCY ATTRIBUTE INSTEAD
@@ -636,10 +669,37 @@ def create_multiple_loaders(
                 )
                 drop_last = False
 
-            loader = DataLoader(
-                dataset,
-                batch_size=batch_size_for_type,
-                shuffle=False,
+            # Dynamic batching by total residues per batch (same param as structure path)
+            max_atoms = params.get("MAX_ATOMS_PER_BATCH")
+            use_dynamic = (
+                batch_sampler is None
+                and max_atoms is not None
+                and hasattr(dataset, "get_atom_counts")
+            )
+            if use_dynamic:
+                atom_counts = dataset.get_atom_counts()
+                base_batch_sampler = DynamicBatchSampler(
+                    element_sampler=sequence_sampler,
+                    atom_counts=atom_counts,
+                    max_atoms_per_batch=max_atoms,
+                    drop_last=(dataset_type == "train"),
+                    world_size=world_size,
+                    rank=rank,
+                    max_elements_per_batch=batch_size_for_type,
+                )
+                # Ensure all ranks see the same number of batches by padding with
+                # indices >= len(dataset), which trigger _get_padding_sample().
+                batch_sampler = PaddedDynamicBatchSampler(
+                    base_batch_sampler=base_batch_sampler,
+                    dataset_len=len(dataset),
+                    world_size=world_size,
+                    rank=rank,
+                )
+                sequence_sampler = None
+
+            # batch_sampler is mutually exclusive with batch_size, shuffle, sampler, drop_last
+            loader_kwargs = dict(
+                dataset=dataset,
                 collate_fn=partial(
                     collate_variable_sequence_length,
                     label_sample_size=label_sample_size,
@@ -652,10 +712,16 @@ def create_multiple_loaders(
                 ),
                 num_workers=num_workers,
                 pin_memory=pin_memory,
-                drop_last=drop_last,
-                sampler=sequence_sampler,
-                batch_sampler=batch_sampler,
+                persistent_workers=num_workers > 0,  # Avoid last-batch delay from worker cleanup
             )
+            if batch_sampler is not None:
+                loader_kwargs["batch_sampler"] = batch_sampler
+            else:
+                loader_kwargs["batch_size"] = batch_size_for_type
+                loader_kwargs["shuffle"] = False
+                loader_kwargs["sampler"] = sequence_sampler
+                loader_kwargs["drop_last"] = drop_last
+            loader = DataLoader(**loader_kwargs)
             loaders[dataset_type].append(loader)
 
     return loaders

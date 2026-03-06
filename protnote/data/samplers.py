@@ -124,26 +124,79 @@ class DistributedWeightedSampler(Sampler):
         self.epoch = epoch
 
 
+def _batch_count_for_atom_budget(
+    indices, atom_counts, max_atoms_per_batch, drop_last, max_elements_per_batch=None
+):
+    """Count batches for a given index list (same logic as DynamicBatchSampler.__iter__)."""
+    count, batch_atoms, batch_size = 0, 0, 0
+    for idx in indices:
+        n = atom_counts[idx]
+        if batch_atoms > 0 and (
+            batch_atoms + n > max_atoms_per_batch
+            or (max_elements_per_batch is not None and batch_size >= max_elements_per_batch)
+        ):
+            count += 1
+            batch_atoms = 0
+            batch_size = 0
+        batch_atoms += n
+        batch_size += 1
+    if batch_atoms > 0 and not drop_last:
+        count += 1
+    return max(1, count)
+
+
+PADDING_SEQUENCE_ID = "__PADDING__"
+
+
 class DynamicBatchSampler(BatchSampler):
     """Groups indices into variable-size batches targeting a max atom budget.
 
     A single protein always forms its own batch (never split), even if it
     exceeds the budget. Wraps any existing element sampler (Distributed,
     Weighted, etc.).
+
+    Optional max_elements_per_batch: cap on number of samples per batch (e.g. 8).
+    A batch is emitted when either the atom budget or this element cap is reached.
     """
 
-    def __init__(self, element_sampler, atom_counts, max_atoms_per_batch, drop_last=False):
+    def __init__(
+        self,
+        element_sampler,
+        atom_counts,
+        max_atoms_per_batch,
+        drop_last=False,
+        world_size=1,
+        rank=0,
+        max_elements_per_batch=None,
+    ):
         # Intentionally skip BatchSampler.__init__ — we manage state ourselves
-        self.element_sampler = element_sampler
-        self.atom_counts = atom_counts  # array indexed by dataset position
+        self.atom_counts = atom_counts
         self.max_atoms_per_batch = max_atoms_per_batch
         self.drop_last = drop_last
+        self.max_elements_per_batch = max_elements_per_batch
+        self.element_sampler = element_sampler
+
+    def _batch_count_for_indices(self, indices):
+        """Count batches for a given index list (same logic as __iter__)."""
+        return _batch_count_for_atom_budget(
+            indices,
+            self.atom_counts,
+            self.max_atoms_per_batch,
+            self.drop_last,
+            self.max_elements_per_batch,
+        )
 
     def __iter__(self):
         batch, batch_atoms = [], 0
         for idx in self.element_sampler:
             n = self.atom_counts[idx]
-            if batch and batch_atoms + n > self.max_atoms_per_batch:
+            if batch and (
+                batch_atoms + n > self.max_atoms_per_batch
+                or (
+                    self.max_elements_per_batch is not None
+                    and len(batch) >= self.max_elements_per_batch
+                )
+            ):
                 yield batch
                 batch, batch_atoms = [], 0
             batch.append(idx)
@@ -152,14 +205,75 @@ class DynamicBatchSampler(BatchSampler):
             yield batch
 
     def __len__(self):
-        # Approximate: total atoms seen by this sampler / budget
-        total = sum(self.atom_counts[i] for i in range(len(self.atom_counts)))
-        ratio = len(self.element_sampler) / max(len(self.atom_counts), 1)
-        return max(1, int(total * ratio / self.max_atoms_per_batch))
+        # Exact count so DataLoader/ranks stay in sync (avoids one rank waiting at dist.reduce)
+        indices = list(self.element_sampler)
+        return self._batch_count_for_indices(indices)
 
     def set_epoch(self, epoch):
         if hasattr(self.element_sampler, "set_epoch"):
             self.element_sampler.set_epoch(epoch)
+
+
+class PaddedDynamicBatchSampler(BatchSampler):
+    """
+    Wrap a DynamicBatchSampler so that all ranks see the same number of batches.
+
+    - local_batches: len(base_batch_sampler) on this rank
+    - global_batches: max(local_batches) across ranks (via dist.all_reduce at init / set_epoch)
+    - For ranks with fewer real batches, we emit extra "padding" batches whose indices
+      are >= len(dataset), which triggers _get_padding_sample() in the Dataset.
+    """
+
+    def __init__(self, base_batch_sampler, dataset_len: int, world_size: int = 1, rank: int = 0):
+        # Base sampler is something like DynamicBatchSampler
+        self.base_batch_sampler = base_batch_sampler
+        self.dataset_len = int(dataset_len)
+        self.world_size = world_size
+        self.rank = rank
+        self._sync_batch_counts()
+
+    def _sync_batch_counts(self):
+        # Local number of batches on this rank
+        self.local_batches = len(self.base_batch_sampler)
+        self.global_batches = self.local_batches
+
+        if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+            # Use current CUDA device for NCCL; assumes torch.cuda.set_device(rank) has been called.
+            if torch.cuda.is_available():
+                device = torch.device("cuda", torch.cuda.current_device())
+            else:
+                # Fallback for non-CUDA backends (unlikely in this project)
+                device = torch.device("cpu")
+            t = torch.tensor(self.local_batches, device=device, dtype=torch.int64)
+            dist.all_reduce(t, op=dist.ReduceOp.MAX)
+            self.global_batches = int(t.item())
+
+    def __len__(self):
+        return self.global_batches
+
+    def __iter__(self):
+        # Yield real batches first
+        count = 0
+        for batch in self.base_batch_sampler:
+            yield batch
+            count += 1
+
+        # Then pad up to global_batches with dummy batches that force padding samples
+        pad_batches = self.global_batches - count
+        if pad_batches <= 0:
+            return
+
+        # Each padding batch is a single index >= dataset_len; Dataset.__getitem__
+        # will return _get_padding_sample(), and collate_* will mark is_padding=True.
+        padding_index = self.dataset_len
+        for _ in range(pad_batches):
+            yield [padding_index]
+
+    def set_epoch(self, epoch):
+        if hasattr(self.base_batch_sampler, "set_epoch"):
+            self.base_batch_sampler.set_epoch(epoch)
+        # After shuffling, batch counts might change; resync
+        self._sync_batch_counts()
 
 
 class GridBatchSampler(BatchSampler):

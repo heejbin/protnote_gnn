@@ -1,5 +1,7 @@
+import datetime
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import hydra
@@ -9,8 +11,6 @@ import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 from torch.nn.parallel import DistributedDataParallel as DDP
 from transformers import AutoModel, AutoTokenizer
-
-import wandb
 from protnote.data.datasets import (
     ProteinDataset,
     calculate_sequence_weights,
@@ -39,12 +39,44 @@ from protnote.utils.models import (
 torch.cuda.empty_cache()
 
 
+def _select_gpus_by_memory(n: int) -> list[int]:
+    """Return GPU indices with most free memory, sorted descending. Falls back to 0..n-1 on error."""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode != 0:
+            return list(range(n))
+        gpus = []
+        for line in out.stdout.strip().splitlines():
+            idx_str, free_str = line.split(",", 1)
+            gpus.append((int(idx_str.strip()), int(free_str.strip().split()[0])))
+        gpus.sort(key=lambda x: x[1], reverse=True)
+        return [g for g, _ in gpus[:n]]
+    except Exception:
+        return list(range(n))
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="config")
 def main(cfg: DictConfig):
     run = cfg.run
     validate_arguments(cfg)
 
+    # Optionally select top N GPUs by free memory
+    if getattr(run, "select_gpus_by_memory", False) and run.gpus > 0:
+        selected = _select_gpus_by_memory(run.gpus)
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, selected))
+        print(f"Selected GPUs by free memory: {selected}")
+
     # TODO: If running with multiple GPUs, make sure the vocabularies and embeddings have been pre-generated (otherwise, it will be generated multiple times)
+
+    # Ensure DataLoader worker subprocesses can import protnote (avoids nested-spawn ModuleNotFoundError)
+    project_root = get_project_root()
+    existing = os.environ.get("PYTHONPATH", "")
+    os.environ["PYTHONPATH"] = str(project_root) + (os.pathsep + existing) if existing else str(project_root)
 
     # Distributed computing
     world_size = run.gpus * run.nodes
@@ -52,7 +84,8 @@ def main(cfg: DictConfig):
         run.nr = int(os.environ["NODE_RANK"])
     else:
         os.environ["MASTER_ADDR"] = "localhost"
-        os.environ["MASTER_PORT"] = "8889"
+        if "MASTER_PORT" not in os.environ:
+            os.environ["MASTER_PORT"] = "8889"  # If port in use: MASTER_PORT=8890 python bin/main.py ...
 
     mp.spawn(train_validate_test, nprocs=run.gpus, args=(cfg, world_size))
 
@@ -62,7 +95,18 @@ def train_validate_test(gpu, cfg, world_size):
 
     # Calculate GPU rank (based on node rank and GPU rank within the node) and initialize process group
     rank = run.nr * run.gpus + gpu
-    dist.init_process_group(backend="nccl", init_method="env://", world_size=world_size, rank=rank)
+    dist.init_process_group(
+        backend="nccl",
+        init_method="env://",
+        world_size=world_size,
+        rank=rank,
+        timeout=datetime.timedelta(hours=1),
+    )
+    # GLOO group for syncing CPU metrics (mAP) in validation; avoids slow CPU→GPU copy when using NCCL.
+    try:
+        cpu_metric_pg = dist.new_group(backend="gloo")
+    except Exception:
+        cpu_metric_pg = None
     print(
         f"{'=' * 50}\n"
         f"Initializing GPU {gpu}/{run.gpus - 1} on node {run.nr};\n"
@@ -96,39 +140,16 @@ def train_validate_test(gpu, cfg, world_size):
     # Seed everything so we don't go crazy
     seed_everything(params["SEED"], device)
 
-    # Initialize W&B, if using
-    if is_master and run.wandb_project is not None:
-        wandb.init(
-            project=run.wandb_project,
-            name=f"{run.name}_{timestamp}",
-            config=OmegaConf.to_container(params, resolve=True)
-            | dict(
-                name=run.name,
-                amlt=run.amlt,
-                model_file=run.model_file,
-            ),
-            sync_tensorboard=False,
-            entity=run.wandb_entity,
-        )
-
-        if run.amlt & run.mlflow:
-            import mlflow
-
-            # MLFlow logging for Hyperdrive
-            mlflow.autolog()
-            mlflow.start_run()
-
-        # Log the wandb link
-        logger.info(f"W&B link: {wandb.run.get_url()}")
+    # W&B integration disabled
 
     # Log the params
     logger.info(OmegaConf.to_yaml(params))
 
     # Initialize label tokenizer
-    label_tokenizer = AutoTokenizer.from_pretrained(params["LABEL_ENCODER_CHECKPOINT"], force_download=True)
+    label_tokenizer = AutoTokenizer.from_pretrained(params["LABEL_ENCODER_CHECKPOINT"])
 
     # Initialize label encoder
-    label_encoder = AutoModel.from_pretrained(params["LABEL_ENCODER_CHECKPOINT"], force_download=True)
+    label_encoder = AutoModel.from_pretrained(params["LABEL_ENCODER_CHECKPOINT"])
     if params["GRADIENT_CHECKPOINTING"]:
         raise NotImplementedError("Gradient checkpointing is not yet implemented.")
 
@@ -246,7 +267,8 @@ def train_validate_test(gpu, cfg, world_size):
             sequence_weights = [min(x, params["SAMPLING_UPPER_CLAMP_BOUND"]) for x in sequence_weights]
 
     logger.info("Initializing data loaders...")
-    # Define data loaders - use appropriate loader factory based on encoder type
+    # num_workers>0 allowed in multi-GPU: Trainer syncs with dist.barrier() after each batch load so no rank enters collective before others.
+    num_workers = params["NUM_WORKERS"]
     if use_hybrid:
         loaders = create_structural_loaders(
             datasets,
@@ -254,7 +276,7 @@ def train_validate_test(gpu, cfg, world_size):
             label_sample_sizes=label_sample_sizes,
             shuffle_labels=params["SHUFFLE_LABELS"],
             in_batch_sampling=params["IN_BATCH_SAMPLING"],
-            num_workers=params["NUM_WORKERS"],
+            num_workers=num_workers,
             world_size=world_size,
             rank=rank,
             sequence_weights=sequence_weights,
@@ -267,7 +289,7 @@ def train_validate_test(gpu, cfg, world_size):
             shuffle_labels=params["SHUFFLE_LABELS"],
             in_batch_sampling=params["IN_BATCH_SAMPLING"],
             grid_sampler=params["GRID_SAMPLER"],
-            num_workers=params["NUM_WORKERS"],
+            num_workers=num_workers,
             world_size=world_size,
             rank=rank,
             sequence_weights=sequence_weights,
@@ -411,6 +433,7 @@ def train_validate_test(gpu, cfg, world_size):
         use_amlt=run.amlt,
         loss_fn=loss_fn,
         is_master=is_master,
+        cpu_metric_process_group=cpu_metric_pg,
     )
 
     # Log the number of parameters by layer
@@ -424,20 +447,27 @@ def train_validate_test(gpu, cfg, world_size):
             checkpoint_path=os.path.join(config["DATA_PATH"], run.model_file),
             rank=rank,
             from_checkpoint=run.from_checkpoint,
+            use_checkpoint_momentum_when_mismatch=getattr(run, "use_checkpoint_optimizer_momentum", False),
         )
         logger.info(
-            f"Loading model checkpoing from {os.path.join(config['DATA_PATH'], run.model_file)}. If training, will continue from epoch {Trainer.epoch + 1}.\n"
+            f"Loading model checkpoint from {os.path.join(config['DATA_PATH'], run.model_file)}. If training, will continue from epoch {Trainer.starting_epoch}.\n"
         )
 
     # Initialize EvalMetrics
     eval_metrics = EvalMetrics(device=device)
 
     label_sample_sizes = {
-        k: (v if v is not None else len(datasets[k][0].label_vocabulary)) for k, v in label_sample_sizes.items() if k in datasets.keys()
+        k: (v if v is not None else len(datasets[k][0].label_vocabulary))
+        for k, v in label_sample_sizes.items()
+        if k in datasets.keys()
     }
 
     # Log sizes of all datasets
-    [logger.info(f"{subset_name} dataset size: {len(dataset)}") for subset_name, subset in datasets.items() for dataset in subset]
+    [
+        logger.info(f"{subset_name} dataset size: {len(dataset)}")
+        for subset_name, subset in datasets.items()
+        for dataset in subset
+    ]
 
     ####### TRAINING AND VALIDATION LOOPS #######
     if run.train_path_name is not None:
@@ -448,7 +478,9 @@ def train_validate_test(gpu, cfg, world_size):
             train_eval_metrics=eval_metrics.get_metric_collection_with_regex(
                 pattern="f1_m.*",
                 threshold=0.5,
-                num_labels=label_sample_sizes["train"] if (params["IN_BATCH_SAMPLING"] or params["GRID_SAMPLER"]) is False else None,
+                num_labels=label_sample_sizes["train"]
+                if (params["IN_BATCH_SAMPLING"] or params["GRID_SAMPLER"]) is False
+                else None,
             ),
             val_eval_metrics=eval_metrics.get_metric_collection_with_regex(
                 pattern="f1_m.*",
@@ -543,34 +575,27 @@ def train_validate_test(gpu, cfg, world_size):
         if run.save_val_test_metrics:
             metrics_results.append(run_metrics)
             write_json(metrics_results, run.save_val_test_metrics_file)
-        # Log test metrics
-        if run.test_paths_names:
-            if run.wandb_project is not None:
-                wandb.log(all_test_metrics)
-            if run.amlt & run.mlflow:
-                mlflow.log_metrics(all_test_metrics)
-
-        # Log val metrics
-        if run.validation_path_name:
-            if run.wandb_project is not None:
-                wandb.log(validation_metrics)
-            if run.amlt & run.mlflow:
-                mlflow.log_metrics(validation_metrics)
-
-        # Close metric loggers
-        if run.wandb_project is not None:
-            wandb.finish()
-        if run.amlt & run.mlflow:
-            mlflow.end_run()
 
     # Loggers
-    handlers = logger.handlers[:]
-    for handler in handlers:
-        logger.removeHandler(handler)
-        handler.close()
-    # Torch
-    torch.cuda.empty_cache()
-    dist.destroy_process_group()
+    try:
+        # Make sure all ranks finish before teardown.
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+
+        handlers = logger.handlers[:]
+        for handler in handlers:
+            logger.removeHandler(handler)
+            handler.close()
+
+        # Torch
+        torch.cuda.empty_cache()
+    finally:
+        # Always attempt to cleanly shut down distributed, even if cleanup above fails.
+        if dist.is_available() and dist.is_initialized():
+            try:
+                dist.destroy_process_group()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
